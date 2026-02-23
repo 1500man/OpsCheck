@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>OpsCheck Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; color: #1f2937; }
+    h1 { margin: 0 0 12px; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px; background: #fff; }
+    .summary { min-width: 320px; flex: 1; }
+    .chart { width: 280px; }
+    .donut {
+      width: 170px; height: 170px; border-radius: 50%; margin: 12px auto;
+      background: conic-gradient(#ef4444 var(--used, 0%), #22c55e 0% 100%);
+      position: relative;
+    }
+    .donut::after {
+      content: "";
+      position: absolute;
+      inset: 28px;
+      background: white;
+      border-radius: 50%;
+      border: 1px solid #e5e7eb;
+    }
+    .donut-label {
+      text-align: center;
+      font-size: 13px;
+      margin-top: 4px;
+      color: #374151;
+    }
+    table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+    th, td { border: 1px solid #e5e7eb; padding: 6px 8px; font-size: 12px; }
+    th { background: #f9fafb; text-align: left; }
+    .warn { color: #b91c1c; font-weight: 700; }
+    .ok { color: #166534; font-weight: 700; }
+    .toolbar { margin: 8px 0 14px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .muted { color: #6b7280; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>OpsCheck 管理ダッシュボード</h1>
+  <div class="toolbar">
+    <label>顧客/デバイス:</label>
+    <select id="deviceSelect"></select>
+    <label>ストレージ:</label>
+    <select id="storageSelect"></select>
+    <span class="muted" id="updatedAt"></span>
+  </div>
+
+  <div class="row">
+    <div class="card summary" id="summaryCard"></div>
+    <div class="card chart">
+      <div><b>選択ストレージ容量</b></div>
+      <div class="donut" id="donut"></div>
+      <div class="donut-label" id="donutLabel"></div>
+      <div class="muted" id="storageMeta"></div>
+      <div class="muted">使用: 赤 / 空き: 緑</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px;">
+    <b>ストレージ健康状態 / 使用時間</b>
+    <table id="diskTable">
+      <thead>
+        <tr>
+          <th>FriendlyName</th><th>MediaType</th><th>HealthStatus</th><th>OperationalStatus</th><th>PowerOnHours</th><th>SizeGB</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+<script>
+const records = <?= dashboardJson ?>;
+const select = document.getElementById('deviceSelect');
+const storageSelect = document.getElementById('storageSelect');
+const summaryCard = document.getElementById('summaryCard');
+const updatedAt = document.getElementById('updatedAt');
+
+function esc(v) {
+  return String(v ?? '').replace(/[&<>"]/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));
+}
+
+function makeKey(r) {
+  return `${r.customerName || ''} / ${r.device || ''}`;
+}
+
+function renderSummary(r) {
+  const hsClass = (r.healthStatus === '警告') ? 'warn' : 'ok';
+  summaryCard.innerHTML = `
+    <div><b>顧客名:</b> ${esc(r.customerName)}</div>
+    <div><b>デバイス名:</b> ${esc(r.device)}</div>
+    <div><b>最終受信:</b> ${esc(r.timestamp)}</div>
+    <div><b>ScriptVersion:</b> ${esc(r.scriptVersion || "")}</div>
+    <div><b>OS:</b> ${esc(r.windowsRelease)}</div>
+    <div><b>総合状態:</b> <span class="${hsClass}">${esc(r.healthStatus)}</span></div>
+    <div><b>AV:</b> ${esc(r.antivirusVendor)} / ${esc(r.antivirusProducts)} / ${esc(r.antivirusStatus)}</div>
+    <div><b>Reflect:</b> ${esc(r.macrium)} / 最新 ${esc(r.macriumLatestLog)} / 鮮度 ${esc(r.reflectImageStale)}</div>
+    <div><b>Hasleo:</b> ${esc(r.hasleo)} / 最新 ${esc(r.hasleoLatestImage)} / 鮮度 ${esc(r.hasleoImageStale)}</div>
+    <div><b>警告理由:</b> ${esc(r.warningReason || '(なし)')}</div>
+  `;
+}
+
+function getStorageLabel(v) {
+  const drive = v.Drive ? `${v.Drive}:` : '(ドライブ文字なし)';
+  const diskNo = (v.DiskNumber === null || v.DiskNumber === undefined || v.DiskNumber === '') ? '不明' : v.DiskNumber;
+  return `${drive} / Disk ${diskNo}`;
+}
+
+function getSelectedVolume(r) {
+  const vols = r.volumes || [];
+  const idx = Number(storageSelect.value || 0);
+  return vols[idx] || null;
+}
+
+function buildStorageSelector(r) {
+  const vols = r.volumes || [];
+  storageSelect.innerHTML = '';
+  vols.forEach((v, i) => {
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = getStorageLabel(v);
+    storageSelect.appendChild(opt);
+  });
+
+  const cIdx = vols.findIndex(v => String(v.Drive || '').toUpperCase() === 'C');
+  storageSelect.value = String(cIdx >= 0 ? cIdx : 0);
+}
+
+function findDiskHealthByVolume(r, v) {
+  if (!v) return null;
+  const diskNo = String(v.DiskNumber ?? '');
+  return (r.diskHealth || []).find(d => String(d.DeviceId ?? '') === diskNo) || null;
+}
+
+function renderDonut(r) {
+  const c = getSelectedVolume(r);
+  const donut = document.getElementById('donut');
+  const label = document.getElementById('donutLabel');
+  const storageMeta = document.getElementById('storageMeta');
+  if (!c || !c.SizeGB) {
+    donut.style.setProperty('--used', '0%');
+    label.textContent = '選択ストレージ情報なし';
+    storageMeta.textContent = '';
+    return;
+  }
+  const usedPct = Math.max(0, Math.min(100, (Number(c.UsedGB) / Number(c.SizeGB)) * 100));
+  donut.style.setProperty('--used', `${usedPct}%`);
+  label.textContent = `使用 ${Number(c.UsedGB).toFixed(2)}GB / 空き ${Number(c.FreeGB).toFixed(2)}GB / 合計 ${Number(c.SizeGB).toFixed(2)}GB`;
+
+  const d = findDiskHealthByVolume(r, c);
+  const usageHours = (c.UsageHours === null || c.UsageHours === undefined || c.UsageHours === '') ? '不明' : `${c.UsageHours}h`;
+  const health = d ? `${d.HealthStatus || ''} / ${d.OperationalStatus || ''}` : '不明';
+  storageMeta.textContent = `使用時間: ${usageHours} / 健康状態: ${health}`;
+}
+
+function renderDiskTable(r) {
+  const tbody = document.querySelector('#diskTable tbody');
+  const rows = r.diskHealth || [];
+  tbody.innerHTML = rows.map(d => `
+    <tr>
+      <td>${esc(d.FriendlyName)}</td>
+      <td>${esc(d.MediaType)}</td>
+      <td>${esc(d.HealthStatus)}</td>
+      <td>${esc(d.OperationalStatus)}</td>
+      <td>${esc(d.PowerOnHours)}</td>
+      <td>${esc(d.SizeGB)}</td>
+    </tr>
+  `).join('');
+}
+
+function render(idx) {
+  const r = records[idx];
+  if (!r) return;
+  updatedAt.textContent = `最終更新: ${r.timestamp}`;
+  renderSummary(r);
+  buildStorageSelector(r);
+  renderDonut(r);
+  renderDiskTable(r);
+}
+
+records.forEach((r, i) => {
+  const opt = document.createElement('option');
+  opt.value = String(i);
+  opt.textContent = makeKey(r);
+  select.appendChild(opt);
+});
+
+select.addEventListener('change', e => render(Number(e.target.value)));
+storageSelect.addEventListener('change', () => renderDonut(records[Number(select.value || 0)]));
+render(0);
+</script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+{
+  "endpoint": "https://script.google.com/macros/s/AKfycbwula2MfLm0QKLgC_Lo5-gE_YxfIOIHLeN_LCIVX1JFp87ny5NIW42MLfp8SDzRQjD1RA/exec",
+  "customerName": "クライアント端末名",
+  "sharedSecret": "CHANGE_ME",
+  "deviceName": "",
+  "requestTimeoutSec": 60,
+  "requestMaxRetries": 2,
+  "requestRetryDelaySec": 5,
+  "scriptVersion": "2026.02.23.1"
+}
