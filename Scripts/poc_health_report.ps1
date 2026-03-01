@@ -31,7 +31,6 @@ if (Test-Path $configPath) {
     if ($cfg.requestTimeoutSec) { $requestTimeoutSec = [int]$cfg.requestTimeoutSec }
     if ($cfg.requestMaxRetries) { $requestMaxRetries = [int]$cfg.requestMaxRetries }
     if ($cfg.requestRetryDelaySec) { $requestRetryDelaySec = [int]$cfg.requestRetryDelaySec }
-    if ($cfg.scriptVersion) { $scriptVersion = [string]$cfg.scriptVersion }
     Write-Host "[INFO] Loaded client config: $configPath"
   } catch {
     Write-Warning "[WARN] Failed to load client config ($configPath): $($_.Exception.Message)"
