@@ -115,6 +115,7 @@ try {
   $files = @(
     "scripts/poc_health_report.ps1",
     "scripts/run_health_report_hidden.vbs",
+    "scripts/run_updater_hidden.vbs",
     "scripts/client_config.sample.json",
     "scripts/update_opscheck_from_github.ps1"
   )
