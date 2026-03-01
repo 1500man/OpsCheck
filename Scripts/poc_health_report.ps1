@@ -7,7 +7,7 @@
 # ===== Settings =====
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $configPath = Join-Path $scriptDir "client_config.json"
-$scriptVersion = "2026.02.23.1"
+$scriptVersion = "2026.03.01.1"
 
 $endpoint = ""
 $deviceName = $env:COMPUTERNAME
