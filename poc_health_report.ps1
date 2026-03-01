@@ -7,7 +7,7 @@
 # ===== Settings =====
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $configPath = Join-Path $scriptDir "client_config.json"
-$scriptVersion = "2026.03.01.1"
+$ScriptVersion = "2026.03.01.1"
 
 $endpoint = ""
 $deviceName = $env:COMPUTERNAME
@@ -24,6 +24,7 @@ $ProgressPreference = 'SilentlyContinue'
 if (Test-Path $configPath) {
   try {
     $cfg = Get-Content -Path $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+
     if ($cfg.endpoint) { $endpoint = [string]$cfg.endpoint }
     if ($cfg.customerName) { $customerName = [string]$cfg.customerName }
     if ($cfg.sharedSecret) { $sharedSecret = [string]$cfg.sharedSecret }
@@ -427,7 +428,7 @@ $healthStatus = if ($alerts.Count -eq 0) { "OK" } else { "WARN" }
 $payload = [PSCustomObject]@{
   device = $deviceName
   customerName = $customerName
-  scriptVersion = $scriptVersion
+  scriptVersion = $ScriptVersion
   timestamp = $timestamp
   volumes = $volumes
   diskHealth = $diskHealth
