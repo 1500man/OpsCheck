@@ -402,9 +402,6 @@ $reflectLatestImageText = Convert-ToDateString $reflectLatestImageTime
 $reflectImageStale = if ($reflectLatestImageTime) {
   ((Get-Date) - $reflectLatestImageTime).TotalDays -gt $recoveryImageAgeDays
 } else { $true }
-if ($reflectImageStale) {
-  $alerts += "Reflect image is older than ${recoveryImageAgeDays} days or not found"
-}
 
 # ===== Hasleo Backup image latest creation =====
 $hasleoImageLatest = $null
@@ -493,15 +490,26 @@ $hasleoImageStale = $null
 if ($hasleoInstalled) {
   if (-not $hasleoEvidenceFound) {
     $hasleoImageStale = $true
-    $alerts += "Hasleo image evidence not found"
   } else {
     $hasleoImageStale = ((Get-Date) - $hasleoLatestImageTime).TotalDays -gt $recoveryImageAgeDays
-    if ($hasleoImageStale) {
-      $alerts += "Hasleo image is older than ${recoveryImageAgeDays} days"
-    }
   }
 }
 
+# ===== Backup warning OR logic =====
+# どちらか一方でも「28日以内の有効なイメージ」があれば警告しない
+$reflectBackupOk = $false
+if ($reflectLatestImageTime) {
+  $reflectBackupOk = (((Get-Date) - $reflectLatestImageTime).TotalDays -le $recoveryImageAgeDays)
+}
+
+$hasleoBackupOk = $false
+if ($hasleoLatestImageTime) {
+  $hasleoBackupOk = (((Get-Date) - $hasleoLatestImageTime).TotalDays -le $recoveryImageAgeDays)
+}
+
+if (-not $reflectBackupOk -and -not $hasleoBackupOk) {
+  $alerts += "バックアップが未検出または古いです"
+}
 $healthStatus = if ($alerts.Count -eq 0) { "OK" } else { "WARN" }
 
 # ===== Payload (GASが受け取れる名前に完全に一致させる) =====
@@ -519,7 +527,9 @@ $payload = [PSCustomObject]@{
     avStatus      = if ($antivirusDetected) { "正常" } else { "未検出" }
     eset          = if ($esetInstalled) { "正常" } else { "未検出" }
     macrium       = if ($macriumInstalled) { "正常" } else { "未検出" }
+    macriumDate   = $reflectLatestImageText
     hasleo        = if ($hasleoInstalled) { "正常" } else { "未検出" }
+    hasleoDate    = $hasleoLatestImageText
 }
 
 # 送信直前に中身を確認するためのログ出力
@@ -547,6 +557,8 @@ for ($attempt = 1; $attempt -le $requestMaxRetries; $attempt++) {
 if (-not $response) {
   Write-Error "[ERROR] Report send failed after ${requestMaxRetries} attempts."
 }
+
+
 
 
 
