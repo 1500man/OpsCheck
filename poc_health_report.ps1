@@ -1,17 +1,23 @@
 # PowerShell PoC health report sender (Windows 11)
 # Usage:
-#   1) Replace $endpoint with your GAS Web App URL
-#   2) Set $customerName / $sharedSecret
+#   1) Set endpoint/sharedSecret in system_config.json
+#   2) Set customer/device info in client_info.json
 #   3) Run: powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File .\poc_health_report.ps1
 
 # ===== Settings =====
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$configPath = Join-Path $scriptDir "client_config.json"
+$clientInfoPath = Join-Path $scriptDir "client_info.json"
+$systemConfigPath = Join-Path $scriptDir "system_config.json"
 $ScriptVersion = "2026.03.01.1"
 
 $endpoint = ""
 $deviceName = $env:COMPUTERNAME
 $customerName = "Customer-Name-Here"
+$customerGroup = ""
+$customerEmail = ""
+$servicePlan = "monthly"
+$pcLocation = ""
+$pcUser = ""
 $sharedSecret = "CHANGE_ME"
 $timestamp = (Get-Date).ToString("yyyy/MM/dd HH:mm:ss")
 $requestTimeoutSec = 60
@@ -21,28 +27,56 @@ $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [System.Net.ServicePointManager]::Expect100Continue = $false
 
-if (Test-Path $configPath) {
-  try {
-    $cfg = Get-Content -Path $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+if (-not (Test-Path $clientInfoPath)) {
+  Write-Error "[ERROR] client_info.json is not found: $clientInfoPath"
+  exit 1
+}
+if (-not (Test-Path $systemConfigPath)) {
+  Write-Error "[ERROR] system_config.json is not found: $systemConfigPath"
+  exit 1
+}
 
-    if ($cfg.endpoint) { $endpoint = [string]$cfg.endpoint }
-    if ($cfg.customerName) { $customerName = [string]$cfg.customerName }
-    if ($cfg.sharedSecret) { $sharedSecret = [string]$cfg.sharedSecret }
-    if ($cfg.deviceName) { $deviceName = [string]$cfg.deviceName }
-    if ($cfg.requestTimeoutSec) { $requestTimeoutSec = [int]$cfg.requestTimeoutSec }
-    if ($cfg.requestMaxRetries) { $requestMaxRetries = [int]$cfg.requestMaxRetries }
-    if ($cfg.requestRetryDelaySec) { $requestRetryDelaySec = [int]$cfg.requestRetryDelaySec }
-    Write-Host "[INFO] Loaded client config: $configPath"
-  } catch {
-    Write-Warning "[WARN] Failed to load client config ($configPath): $($_.Exception.Message)"
+try {
+  $clientInfo = Get-Content -Path $clientInfoPath -Raw -Encoding UTF8 | ConvertFrom-Json
+  $systemConfig = Get-Content -Path $systemConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+
+  # Merge both configs in memory. system_config values override on key conflict.
+  $cfg = @{}
+  $clientInfo.PSObject.Properties | ForEach-Object { $cfg[$_.Name] = $_.Value }
+  $systemConfig.PSObject.Properties | ForEach-Object { $cfg[$_.Name] = $_.Value }
+
+  if ($cfg.endpoint) { $endpoint = [string]$cfg.endpoint }
+  if ($cfg.customerName) { $customerName = [string]$cfg.customerName }
+  if ($cfg.customerGroup) { $customerGroup = [string]$cfg.customerGroup }
+  if ($cfg.customerEmail) { $customerEmail = [string]$cfg.customerEmail }
+  if ($cfg.servicePlan) { $servicePlan = [string]$cfg.servicePlan }
+  if ($cfg.pcLocation) { $pcLocation = [string]$cfg.pcLocation }
+  if ($cfg.pcUser) { $pcUser = [string]$cfg.pcUser }
+  if ($cfg.sharedSecret) { $sharedSecret = [string]$cfg.sharedSecret }
+  if ($cfg.deviceName) { $deviceName = [string]$cfg.deviceName }
+  if ($cfg.requestTimeoutSec) { $requestTimeoutSec = [int]$cfg.requestTimeoutSec }
+  if ($cfg.requestMaxRetries) { $requestMaxRetries = [int]$cfg.requestMaxRetries }
+  if ($cfg.requestRetryDelaySec) { $requestRetryDelaySec = [int]$cfg.requestRetryDelaySec }
+  if ($cfg.scriptVersion) { $ScriptVersion = [string]$cfg.scriptVersion }
+
+  Write-Host "[INFO] Loaded client info: $clientInfoPath"
+  Write-Host "[INFO] Loaded system config: $systemConfigPath"
+} catch {
+  Write-Error "[ERROR] Failed to load config files: $($_.Exception.Message)"
+  exit 1
+}
+
+# Keep backward compatibility: if customerName is not explicitly set, reuse customerGroup.
+if ([string]::IsNullOrWhiteSpace($customerName) -or $customerName -eq "Customer-Name-Here") {
+  if (-not [string]::IsNullOrWhiteSpace($customerGroup)) {
+    $customerName = $customerGroup
   }
 }
 
 if ([string]::IsNullOrWhiteSpace($endpoint) -or $endpoint -match "PUT_YOUR_GAS_ID") {
-  Write-Error "[ERROR] endpoint is not configured. Set endpoint in client_config.json"
+  Write-Error "[ERROR] endpoint is not configured. Set endpoint in system_config.json"
   exit 1
 }
-
 # ===== Thresholds =====
 $minCFreeGB = 100
 $minRecoveryFreeGB = 300
@@ -56,65 +90,111 @@ function Convert-ToDateString($value) {
   return ([datetime]$value).ToString("yyyy/MM/dd HH:mm:ss")
 }
 
-# ===== Volume info =====
-$volumes = Get-Volume | Where-Object { $_.DriveLetter -and $_.Size -gt 0 } | ForEach-Object {
-  $sizeGB = [Math]::Round($_.Size / 1GB, 2)
-  $freeGB = [Math]::Round($_.SizeRemaining / 1GB, 2)
-  [PSCustomObject]@{
-    Drive = $_.DriveLetter
-    FileSystem = $_.FileSystem
-    SizeGB = $sizeGB
-    FreeGB = $freeGB
-    UsedGB = [Math]::Round($sizeGB - $freeGB, 2)
-    DiskNumber = $null
-    UsageHours = $null
+# ===== Volume info (dashboard schema aligned) =====
+$smartctlPath = "C:\Program Files\smartmontools\bin\smartctl.exe"
+
+# --- 1) バックアップドライブの特定 ---
+$backupPaths = @("D:\Macrium", "E:\Macrium", "D:\Hasleo", "E:\Hasleo")
+$backupDriveLetter = ""
+foreach ($path in $backupPaths) {
+  if (Test-Path $path) {
+    $backupDriveLetter = $path.Substring(0, 1).ToUpper()
+    break
   }
 }
 
-# ===== Physical disk health / usage hours =====
-$diskHealth = @()
-try {
-  $physicalDisks = Get-PhysicalDisk -ErrorAction Stop
-  foreach ($disk in $physicalDisks) {
-    $powerOnHours = $null
-    try {
-      $reliability = Get-StorageReliabilityCounter -PhysicalDisk $disk -ErrorAction Stop
-      $powerOnHours = $reliability.PowerOnHours
-    } catch {
-      $powerOnHours = $null
-    }
-
-    $diskHealth += [PSCustomObject]@{
-      DeviceId = $disk.DeviceId
-      FriendlyName = $disk.FriendlyName
-      MediaType = $disk.MediaType
-      HealthStatus = $disk.HealthStatus
-      OperationalStatus = ($disk.OperationalStatus -join ',')
-      SizeGB = [Math]::Round($disk.Size / 1GB, 2)
-      PowerOnHours = $powerOnHours
-    }
-  }
-} catch {
-  $diskHealth = @()
-}
-
-# ===== Volume to disk mapping (for usage hours in VolumesJSON) =====
-foreach ($v in $volumes) {
+# --- 2) smartctl で物理ディスク情報を取得（シリアル番号辞書） ---
+$smartDisks = @{}
+if (Test-Path $smartctlPath) {
   try {
-    $partition = Get-Partition -DriveLetter $v.Drive -ErrorAction Stop | Select-Object -First 1
-    if ($partition) {
-      $diskNumber = [int]$partition.DiskNumber
-      $v.DiskNumber = $diskNumber
-      $matchedDisk = $diskHealth | Where-Object { $_.DeviceId -eq $diskNumber } | Select-Object -First 1
-      if ($matchedDisk -and $null -ne $matchedDisk.PowerOnHours) {
-        $v.UsageHours = [int64]$matchedDisk.PowerOnHours
+    $scanJsonStr = & $smartctlPath --scan -j
+    $scanData = $scanJsonStr | ConvertFrom-Json
+
+    if ($scanData.devices) {
+      foreach ($dev in $scanData.devices) {
+        try {
+          $detailJsonStr = & $smartctlPath -x $dev.name -j
+          $detail = $detailJsonStr | ConvertFrom-Json
+
+          $serial = if ($detail.serial_number) { [string]$detail.serial_number.Trim() } else { "" }
+          if (-not [string]::IsNullOrWhiteSpace($serial)) {
+            $isPassed = $detail.smart_status.passed
+            $healthBase = if ($isPassed -eq $true) { "正常" } elseif ($isPassed -eq $false) { "警告" } else { "不明" }
+
+            $healthPct = ""
+            if ($detail.nvme_smart_health_information_log) {
+              $used = $detail.nvme_smart_health_information_log.percentage_used
+              if ($null -ne $used) {
+                $remaining = 100 - [int]$used
+                $healthPct = " ($remaining%)"
+              }
+            }
+
+            $tempStr = if ($detail.temperature.current) { "$($detail.temperature.current)℃" } else { "不明" }
+            $hoursStr = if ($detail.power_on_time.hours) { "$($detail.power_on_time.hours)時間" } else { "不明" }
+
+            $smartDisks[$serial] = @{
+              SmartHealth = "${healthBase}${healthPct}"
+              SmartTemp   = $tempStr
+              UsageHours  = $hoursStr
+            }
+          }
+        } catch {
+          # smartctl詳細取得失敗時はスキップ
+        }
       }
     }
   } catch {
-    # leave DiskNumber / UsageHours as null
+    # smartctl全体失敗時はスキップ
   }
 }
 
+# --- 3) Windowsドライブ情報にSMART情報を合体 ---
+$volumes = @()
+$localDrives = Get-Volume | Where-Object { $_.DriveType -eq 'Fixed' -and $_.DriveLetter }
+
+foreach ($vol in $localDrives) {
+  $letter = [string]($vol.DriveLetter).ToString().ToUpper()
+  $isBackup = ($letter -eq $backupDriveLetter)
+  $isTarget = ($letter -eq "C") -or $isBackup
+
+  $sizeGB = [math]::Round($vol.Size / 1GB, 2)
+  $freeGB = [math]::Round($vol.SizeRemaining / 1GB, 2)
+  $usedGB = [math]::Round($sizeGB - $freeGB, 2)
+
+  $smartHealth = "不明"
+  $smartTemp = "不明"
+  $usageHours = "不明"
+
+  try {
+    $partition = Get-Partition -DriveLetter $letter -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($partition) {
+      $physDisk = Get-PhysicalDisk | Where-Object DeviceId -eq $partition.DiskNumber | Select-Object -First 1
+      if ($physDisk -and $physDisk.SerialNumber) {
+        $winSerial = [string]$physDisk.SerialNumber.Trim()
+        if ($smartDisks.ContainsKey($winSerial)) {
+          $smartHealth = [string]$smartDisks[$winSerial].SmartHealth
+          $smartTemp = [string]$smartDisks[$winSerial].SmartTemp
+          $usageHours = [string]$smartDisks[$winSerial].UsageHours
+        }
+      }
+    }
+  } catch {
+    # 個別ドライブ失敗時は不明のまま
+  }
+
+  $volumes += [PSCustomObject]@{
+    Drive       = $letter
+    IsTarget    = $isTarget
+    IsBackup    = $isBackup
+    SizeGB      = $sizeGB
+    UsedGB      = $usedGB
+    FreeGB      = $freeGB
+    SmartHealth = $smartHealth
+    SmartTemp   = $smartTemp
+    UsageHours  = $usageHours
+  }
+}
 # ===== Threshold evaluation =====
 $alerts = @()
 $cDrive = $volumes | Where-Object { $_.Drive -eq "C" } | Select-Object -First 1
@@ -424,41 +504,31 @@ if ($hasleoInstalled) {
 
 $healthStatus = if ($alerts.Count -eq 0) { "OK" } else { "WARN" }
 
-# ===== Payload =====
+# ===== Payload (GASが受け取れる名前に完全に一致させる) =====
+$finalHealth = if ($alerts.Count -eq 0) { "正常" } else { "警告" }
+
+$alertsForJson = if ($alerts.Count -eq 0) { @("特になし") } else { @($alerts) }
+
 $payload = [PSCustomObject]@{
-  device = $deviceName
-  customerName = $customerName
-  scriptVersion = $ScriptVersion
-  timestamp = $timestamp
-  volumes = $volumes
-  diskHealth = $diskHealth
-  windowsRelease = $windowsRelease
-  healthStatus = $healthStatus
-  alerts = $alerts
-  minCFreeGB = $minCFreeGB
-  minRecoveryFreeGB = $minRecoveryFreeGB
-  recoveryDrives = $recoveryImageDriveLetters
-  antivirusDetected = $antivirusDetected
-  antivirusVendor = $antivirusVendor
-  antivirusProducts = $antivirusProductsText
-  antivirusLatestEvidence = $antivirusLatestEvidenceText
-  antivirusEvidenceStale = $antivirusEvidenceStale
-  esetInstalled = $esetInstalled
-  esetServiceStatus = $esetServiceStatus
-  esetLatestScan = $esetLatestScanText
-  esetScanStale = $esetScanStale
-  macriumInstalled = $macriumInstalled
-  macriumLatestLog = $reflectLatestImageText
-  reflectImageStale = $reflectImageStale
-  hasleoInstalled = $hasleoInstalled
-  hasleoLatestImage = $hasleoLatestImageText
-  hasleoLatestPath = $hasleoLatestPath
-  hasleoImageStale = $hasleoImageStale
-  authToken = $sharedSecret
+    timestamp     = $timestamp
+    customerGroup = if ($customerGroup) { $customerGroup } else { "未設定" }
+    device        = $env:COMPUTERNAME
+    health        = $finalHealth
+    alerts        = [object[]]$alertsForJson
+    volumes       = $volumes
+    avStatus      = if ($antivirusDetected) { "正常" } else { "未検出" }
+    eset          = if ($esetInstalled) { "正常" } else { "未検出" }
+    macrium       = if ($macriumInstalled) { "正常" } else { "未検出" }
+    hasleo        = if ($hasleoInstalled) { "正常" } else { "未検出" }
 }
 
+# 送信直前に中身を確認するためのログ出力
+$jsonBody = $payload | ConvertTo-Json -Depth 8 -Compress
+Write-Host "=== GASへ送信するJSONデータ ===" -ForegroundColor Cyan
+Write-Host ($payload | ConvertTo-Json -Depth 8)
+Write-Host "=============================" -ForegroundColor Cyan
+
 # ===== Send =====
-$jsonBody = $payload | ConvertTo-Json -Depth 8
 Write-Host "[INFO] Sending report to GAS... (timeout=${requestTimeoutSec}s, retries=${requestMaxRetries})"
 $response = $null
 for ($attempt = 1; $attempt -le $requestMaxRetries; $attempt++) {
@@ -469,25 +539,15 @@ for ($attempt = 1; $attempt -le $requestMaxRetries; $attempt++) {
     break
   }
   catch {
-    Write-Warning "[WARN] Send attempt ${attempt}/${requestMaxRetries} failed (Invoke-RestMethod): $($_.Exception.Message)"
-
-    try {
-      $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes($jsonBody)
-      $fallback = Invoke-WebRequest -Uri $endpoint -Method Post -ContentType "application/json; charset=utf-8" -Body $jsonBytes -TimeoutSec $requestTimeoutSec -UseBasicParsing -ErrorAction Stop
-      $response = $fallback.Content
-      Write-Host "[INFO] GAS response (fallback): $response"
-      break
-    }
-    catch {
-      Write-Warning "[WARN] Send attempt ${attempt}/${requestMaxRetries} fallback failed (Invoke-WebRequest): $($_.Exception.Message)"
-    }
-
-    if ($attempt -lt $requestMaxRetries) {
-      Start-Sleep -Seconds $requestRetryDelaySec
-    }
+    Write-Warning "[WARN] Send attempt ${attempt}/${requestMaxRetries} failed: $($_.Exception.Message)"
+    if ($attempt -lt $requestMaxRetries) { Start-Sleep -Seconds $requestRetryDelaySec }
   }
 }
 
 if (-not $response) {
-  Write-Error "[ERROR] Report send failed after ${requestMaxRetries} attempts. Check endpoint/network/proxy settings."
+  Write-Error "[ERROR] Report send failed after ${requestMaxRetries} attempts."
 }
+
+
+
+
