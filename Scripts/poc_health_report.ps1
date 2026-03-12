@@ -8,7 +8,7 @@
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $clientInfoPath = Join-Path $scriptDir "client_info.json"
 $systemConfigPath = Join-Path $scriptDir "system_config.json"
-$ScriptVersion = "2026.03.12.2" # バージョン更新（Hasleo強力検知版）
+$ScriptVersion = "2026.03.12.3" # バージョン更新（検索超高速化版）
 
 $endpoint = ""
 $deviceName = $env:COMPUTERNAME
@@ -182,7 +182,7 @@ $antivirusEvidenceStale = $false
 $esetInstalled = Test-Path "C:\Program Files\ESET\"
 $macriumInstalled = Test-Path "C:\Program Files\Macrium\Reflect\"
 
-# ★Hasleoの強力検知（ワイルドカードパス検索 ＋ レジストリ検索）
+# ★Hasleoの強力検知
 $hasleoInstalled = $false
 if ((Test-Path "C:\Program Files*\Hasleo*") -or (Test-Path "C:\Program Files*\Hasleo Backup Suite*")) {
     $hasleoInstalled = $true
@@ -200,24 +200,35 @@ if ($esetInstalled) { $esetScanStale = $false }
 $winReg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
 $windowsRelease = "{0} (Build {1})" -f $winReg.DisplayVersion, $winReg.CurrentBuild
 
-# ===== Reflect & Hasleo Image Search =====
+# ===== Reflect & Hasleo Image Search (★超高速最適化版) =====
 $reflectImageLatest = $null
 $hasleoImageLatest = $null
-$psDrives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -ne $null }
 
-foreach ($d in $psDrives) {
-  $root = $d.Root.TrimEnd('\')
-  
-  # Reflect search
-  $foundR = Get-ChildItem -Path "$root" -Filter "*.mrimg" -File -Recurse -Force -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-  if ($foundR) { if (-not $reflectImageLatest -or $foundR.LastWriteTime -gt $reflectImageLatest.LastWriteTime) { $reflectImageLatest = $foundR } }
+# インストールされている場合のみ、検索処理を行う
+if ($macriumInstalled -or $hasleoInstalled) {
+    Write-Host "[INFO] バックアップソフトのインストールを検知しました。イメージファイルの検索を開始します..."
+    $psDrives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -ne $null }
 
-  # Hasleo search
-  $hasleoExts = @("*.hbi", "*.hbk", "*.hbc", "*.hbs", "*.dbi")
-  foreach ($ext in $hasleoExts) {
-    $foundH = Get-ChildItem -Path "$root\Hasleo" -Filter $ext -File -Recurse -Force -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($foundH) { if (-not $hasleoImageLatest -or $foundH.LastWriteTime -gt $hasleoImageLatest.LastWriteTime) { $hasleoImageLatest = $foundH } }
-  }
+    foreach ($d in $psDrives) {
+      $root = $d.Root.TrimEnd('\')
+      
+      # ① Reflectがインストールされている場合のみ検索
+      if ($macriumInstalled) {
+          $foundR = Get-ChildItem -Path "$root" -Filter "*.mrimg" -File -Recurse -Force -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($foundR) { if (-not $reflectImageLatest -or $foundR.LastWriteTime -gt $reflectImageLatest.LastWriteTime) { $reflectImageLatest = $foundR } }
+      }
+
+      # ② Hasleoがインストールされている場合のみ検索
+      if ($hasleoInstalled) {
+          $hasleoExts = @("*.hbi", "*.hbk", "*.hbc", "*.hbs", "*.dbi")
+          foreach ($ext in $hasleoExts) {
+            $foundH = Get-ChildItem -Path "$root\Hasleo" -Filter $ext -File -Recurse -Force -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($foundH) { if (-not $hasleoImageLatest -or $foundH.LastWriteTime -gt $hasleoImageLatest.LastWriteTime) { $hasleoImageLatest = $foundH } }
+          }
+      }
+    }
+} else {
+    Write-Host "[INFO] バックアップソフトがインストールされていません。検索をスキップします。"
 }
 
 $reflectLatestImageTime = if ($reflectImageLatest) { $reflectImageLatest.LastWriteTime } else { $null }
