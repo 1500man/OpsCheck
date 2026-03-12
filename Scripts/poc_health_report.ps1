@@ -8,7 +8,7 @@
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $clientInfoPath = Join-Path $scriptDir "client_info.json"
 $systemConfigPath = Join-Path $scriptDir "system_config.json"
-$ScriptVersion = "2026.03.12.1" # バージョン更新
+$ScriptVersion = "2026.03.12.2" # バージョン更新（Hasleo強力検知版）
 
 $endpoint = ""
 $deviceName = $env:COMPUTERNAME
@@ -176,12 +176,22 @@ if ($antivirusDetected) { foreach ($vp in $vendorPatterns) { if ($avProducts -ma
 
 $antivirusLatestEvidence = $null
 $antivirusLatestEvidenceText = ""
-$antivirusEvidenceStale = $false # 簡易化のため一旦false
+$antivirusEvidenceStale = $false
 
 # ===== ESET / Macrium / Hasleo presence =====
 $esetInstalled = Test-Path "C:\Program Files\ESET\"
 $macriumInstalled = Test-Path "C:\Program Files\Macrium\Reflect\"
-$hasleoInstalled = (Test-Path "C:\Program Files\Hasleo\Hasleo Backup Suite\bin") -or (Test-Path "C:\Program Files\Hasleo\Hasleo Backup Suite") -or (Test-Path "C:\Program Files (x86)\Hasleo\Hasleo Backup Suite")
+
+# ★Hasleoの強力検知（ワイルドカードパス検索 ＋ レジストリ検索）
+$hasleoInstalled = $false
+if ((Test-Path "C:\Program Files*\Hasleo*") -or (Test-Path "C:\Program Files*\Hasleo Backup Suite*")) {
+    $hasleoInstalled = $true
+}
+if (-not $hasleoInstalled) {
+    $regPaths = @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*", "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*")
+    $hasleoReg = Get-ItemProperty $regPaths -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match "Hasleo" }
+    if ($hasleoReg) { $hasleoInstalled = $true }
+}
 
 $esetLatestScanText = ""
 $esetScanStale = $true
@@ -190,7 +200,7 @@ if ($esetInstalled) { $esetScanStale = $false }
 $winReg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
 $windowsRelease = "{0} (Build {1})" -f $winReg.DisplayVersion, $winReg.CurrentBuild
 
-# ===== Reflect & Hasleo Image Search (★隠しファイル対応の -Force を追加) =====
+# ===== Reflect & Hasleo Image Search =====
 $reflectImageLatest = $null
 $hasleoImageLatest = $null
 $psDrives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -ne $null }
@@ -202,7 +212,7 @@ foreach ($d in $psDrives) {
   $foundR = Get-ChildItem -Path "$root" -Filter "*.mrimg" -File -Recurse -Force -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
   if ($foundR) { if (-not $reflectImageLatest -or $foundR.LastWriteTime -gt $reflectImageLatest.LastWriteTime) { $reflectImageLatest = $foundR } }
 
-  # Hasleo search (対象拡張子をすべて探す)
+  # Hasleo search
   $hasleoExts = @("*.hbi", "*.hbk", "*.hbc", "*.hbs", "*.dbi")
   foreach ($ext in $hasleoExts) {
     $foundH = Get-ChildItem -Path "$root\Hasleo" -Filter $ext -File -Recurse -Force -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
