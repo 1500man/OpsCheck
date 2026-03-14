@@ -1,45 +1,44 @@
 # ===================================================
-# Virgo Premium - Auto Updater from GitHub
+# Virgo Premium - Secure Auto Updater (v1.1)
 # ===================================================
-param (
-    [string]$AccessMode = "private",
-    [string]$RepoOwner = "1500man",
-    [string]$RepoName = "OpsCheck",
-    [string]$Branch = "main",
-    [string]$GitHubToken = ""
-)
-
 $ErrorActionPreference = 'Continue'
 $TargetDir = "C:\OpsCheck\Scripts"
+$RepoOwner = "1500man"
+$RepoName = "OpsCheck"
+$Branch = "main"
 
-# GitHubから持ってくるファイルのリスト
-# ※今後、新しいスクリプトを追加したらここにファイル名を書き足すだけで全PCに配られます
-$FilesToSync = @(
-    "poc_health_report.ps1",
-    "update_opscheck_from_github.ps1" # 自分自身もアップデートできるようにしておく
-)
+# 1. 要塞解錠フェーズ（金庫からGitHubトークンを取り出す）
+$MasterKey = [Environment]::GetEnvironmentVariable("VIRGO_MASTER_KEY", "Machine")
+if ([string]::IsNullOrEmpty($MasterKey)) { exit }
 
-# 保存先フォルダがなければ作成
-if (!(Test-Path $TargetDir)) { New-Item $TargetDir -ItemType Directory -Force | Out-Null }
+$UUID = (Get-WmiObject Win32_ComputerSystemProduct).UUID
+$EncFile = Join-Path $TargetDir "system_config.enc"
+if (!(Test-Path $EncFile)) { exit }
 
-Write-Host "GitHubからの同期を開始します..." -ForegroundColor Cyan
+$EncryptedText = Get-Content $EncFile -Raw
+$Hasher = [System.Security.Cryptography.SHA256]::Create()
+$KeyBytes = $Hasher.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$MasterKey-$UUID"))
+
+try {
+    $SecureString = $EncryptedText | ConvertTo-SecureString -Key $KeyBytes
+    $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+    $ConfigJson = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+    $Config = $ConfigJson | ConvertFrom-Json
+} catch { exit } 
+finally { if ($null -ne $BSTR -and $BSTR -ne [IntPtr]::Zero) { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR) } }
+
+# 金庫からトークンを取得！
+$GitHubToken = $Config.githubToken
+if ([string]::IsNullOrEmpty($GitHubToken)) { exit }
+
+# 2. GitHubからのダウンロード処理
+$FilesToSync = @("poc_health_report.ps1", "update_opscheck_from_github.ps1")
+$Headers = @{ "Authorization" = "token $GitHubToken" }
 
 foreach ($file in $FilesToSync) {
-    # GitHubのRawデータ取得用URL
     $Url = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/$file"
     $DestPath = Join-Path $TargetDir $file
-
-    # プライベートリポジトリ用の認証ヘッダー
-    $Headers = @{}
-    if ($AccessMode -eq "private" -and !([string]::IsNullOrWhiteSpace($GitHubToken))) {
-        $Headers["Authorization"] = "token $GitHubToken"
-    }
-
     try {
-        # GitHubからファイルをダウンロードして上書き保存
         Invoke-RestMethod -Uri $Url -Headers $Headers -OutFile $DestPath -UseBasicParsing
-        Write-Host "[SUCCESS] $file を最新版に更新しました。" -ForegroundColor Green
-    } catch {
-        Write-Warning "[ERROR] $file のダウンロードに失敗しました: $($_.Exception.Message)"
-    }
+    } catch {}
 }
