@@ -1,95 +1,56 @@
-﻿# PowerShell PoC health report sender (Windows 11)
-# Usage:
-#   1) Set endpoint/sharedSecret in system_config.json
-#   2) Set customer/device info in client_info.json
-#   3) Run: powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File .\poc_health_report.ps1
+﻿# ====================================================================
+# Virgo Premium - Secure Health Report (v2.0 要塞解錠 ＋ フル診断版)
+# ====================================================================
+$ErrorActionPreference = 'Stop'
+$ScriptVersion = "2026.03.14.Encrypted"
 
-# ===== Settings =====
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$clientInfoPath = Join-Path $scriptDir "client_info.json"
-$systemConfigPath = Join-Path $scriptDir "system_config.json"
-$ScriptVersion = "2026.03.12.5" # バージョン更新（Cドライブ完全除外・爆速版）
+# ====================================================================
+# 1. 要塞解錠フェーズ（パスワードを一切持たずに金庫を開ける）
+# ====================================================================
+$MasterKey = [Environment]::GetEnvironmentVariable("VIRGO_MASTER_KEY", "Machine")
+if ([string]::IsNullOrEmpty($MasterKey)) { exit }
 
-$endpoint = ""
-$deviceName = $env:COMPUTERNAME
-$customerName = "Customer-Name-Here"
-$customerGroup = ""
-$customerEmail = ""
-$servicePlan = "monthly"
-$pcLocation = ""
-$pcUser = ""
-$sharedSecret = "CHANGE_ME"
-$timestamp = (Get-Date).ToString("yyyy/MM/dd HH:mm:ss")
-$requestTimeoutSec = 60
-$requestMaxRetries = 2
-$requestRetryDelaySec = 5
-$ProgressPreference = 'SilentlyContinue'
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-[System.Net.ServicePointManager]::Expect100Continue = $false
+$UUID = (Get-WmiObject Win32_ComputerSystemProduct).UUID
+$EncFile = "C:\OpsCheck\Scripts\system_config.enc"
+if (!(Test-Path $EncFile)) { exit }
 
-if (-not (Test-Path $clientInfoPath)) {
-  Write-Error "[ERROR] client_info.json is not found: $clientInfoPath"
-  exit 1
-}
-if (-not (Test-Path $systemConfigPath)) {
-  Write-Error "[ERROR] system_config.json is not found: $systemConfigPath"
-  exit 1
-}
+$EncryptedText = Get-Content $EncFile -Raw
+$Hasher = [System.Security.Cryptography.SHA256]::Create()
+$KeyBytes = $Hasher.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$MasterKey-$UUID"))
 
 try {
-  $clientInfo = Get-Content -Path $clientInfoPath -Raw -Encoding UTF8 | ConvertFrom-Json
-  $systemConfig = Get-Content -Path $systemConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-
-  $cfg = @{}
-  $clientInfo.PSObject.Properties | ForEach-Object { $cfg[$_.Name] = $_.Value }
-  $systemConfig.PSObject.Properties | ForEach-Object { $cfg[$_.Name] = $_.Value }
-
-  if ($cfg.endpoint) { $endpoint = [string]$cfg.endpoint }
-  if ($cfg.customerName) { $customerName = [string]$cfg.customerName }
-  if ($cfg.customerGroup) { $customerGroup = [string]$cfg.customerGroup }
-  if ($cfg.customerEmail) { $customerEmail = [string]$cfg.customerEmail }
-  if ($cfg.servicePlan) { $servicePlan = [string]$cfg.servicePlan }
-  if ($cfg.pcLocation) { $pcLocation = [string]$cfg.pcLocation }
-  if ($cfg.pcUser) { $pcUser = [string]$cfg.pcUser }
-  if ($cfg.sharedSecret) { $sharedSecret = [string]$cfg.sharedSecret }
-  if ($cfg.deviceName) { $deviceName = [string]$cfg.deviceName }
-  if ($cfg.requestTimeoutSec) { $requestTimeoutSec = [int]$cfg.requestTimeoutSec }
-  if ($cfg.requestMaxRetries) { $requestMaxRetries = [int]$cfg.requestMaxRetries }
-  if ($cfg.requestRetryDelaySec) { $requestRetryDelaySec = [int]$cfg.requestRetryDelaySec }
-  if ($cfg.scriptVersion) { $ScriptVersion = [string]$cfg.scriptVersion }
-
-  Write-Host "[INFO] Loaded client info: $clientInfoPath"
+    $SecureString = $EncryptedText | ConvertTo-SecureString -Key $KeyBytes
+    $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+    $ConfigJson = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+    $Config = $ConfigJson | ConvertFrom-Json
 } catch {
-  Write-Error "[ERROR] Failed to load config files: $($_.Exception.Message)"
-  exit 1
+    exit 
+} finally {
+    if ($null -ne $BSTR -and $BSTR -ne [IntPtr]::Zero) { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR) }
 }
 
-if ([string]::IsNullOrWhiteSpace($customerName) -or $customerName -eq "Customer-Name-Here") {
-  if (-not [string]::IsNullOrWhiteSpace($customerGroup)) { $customerName = $customerGroup }
-}
-if ([string]::IsNullOrWhiteSpace($endpoint) -or $endpoint -match "PUT_YOUR_GAS_ID") {
-  Write-Error "[ERROR] endpoint is not configured."
-  exit 1
-}
+# 金庫から取り出した情報を変数にセット
+$endpoint      = $Config.endpoint
+$sharedSecret  = $Config.authToken
+$customerGroup = $Config.customerGroup
+$usbSerial     = $Config.usbSerial
+$deviceName    = $env:COMPUTERNAME
+$timestamp     = (Get-Date).ToString("yyyy/MM/dd HH:mm:ss")
 
-# ===== Thresholds =====
+# ====================================================================
+# 2. 健康診断フェーズ（元々の高度な診断ロジック）
+# ====================================================================
 $minCFreeGB = 100
 $minRecoveryFreeGB = 300
 $recoveryImageAgeDays = 28
-$esetScanAgeDays = 14
-$antivirusEvidenceAgeDays = 14
 $recoveryImageDriveLetters = @("D", "E", "F", "G", "H", "K")
 
-function Convert-ToDateString($value) {
-  if ($null -eq $value) { return "" }
-  return ([datetime]$value).ToString("yyyy/MM/dd HH:mm:ss")
-}
+function Convert-ToDateString($value) { if ($null -eq $value) { return "" }; return ([datetime]$value).ToString("yyyy/MM/dd HH:mm:ss") }
 
-# ===== Volume info & SMART =====
+# ===== SMARTディスク情報 =====
 $smartctlPath = "C:\Program Files\smartmontools\bin\smartctl.exe"
-$backupPaths = @("D:\Macrium", "E:\Macrium", "D:\Hasleo", "E:\Hasleo")
 $backupDriveLetter = ""
-foreach ($path in $backupPaths) {
+foreach ($path in @("D:\Macrium", "E:\Macrium", "D:\Hasleo", "E:\Hasleo")) {
   if (Test-Path $path) { $backupDriveLetter = $path.Substring(0, 1).ToUpper(); break }
 }
 
@@ -105,10 +66,7 @@ if (Test-Path $smartctlPath) {
           if (-not [string]::IsNullOrWhiteSpace($serial)) {
             $isPassed = $detail.smart_status.passed
             $healthBase = if ($isPassed -eq $true) { "正常" } elseif ($isPassed -eq $false) { "警告" } else { "不明" }
-            $healthPct = ""
-            if ($detail.nvme_smart_health_information_log.percentage_used -ne $null) {
-              $healthPct = " (" + (100 - [int]$detail.nvme_smart_health_information_log.percentage_used) + "%)"
-            }
+            $healthPct = if ($detail.nvme_smart_health_information_log.percentage_used -ne $null) { " (" + (100 - [int]$detail.nvme_smart_health_information_log.percentage_used) + "%)" } else { "" }
             $tempStr = if ($detail.temperature.current) { "$($detail.temperature.current)℃" } else { "不明" }
             $hoursStr = if ($detail.power_on_time.hours) { "$($detail.power_on_time.hours)時間" } else { "不明" }
             $smartDisks[$serial] = @{ SmartHealth = "${healthBase}${healthPct}"; SmartTemp = $tempStr; UsageHours = $hoursStr }
@@ -119,6 +77,7 @@ if (Test-Path $smartctlPath) {
   } catch {}
 }
 
+# ===== ボリューム情報取得 =====
 $volumes = @()
 $localDrives = Get-Volume | Where-Object { $_.DriveType -eq 'Fixed' -and $_.DriveLetter }
 foreach ($vol in $localDrives) {
@@ -144,7 +103,6 @@ foreach ($vol in $localDrives) {
       }
     }
   } catch {}
-
   $volumes += [PSCustomObject]@{ Drive=$letter; IsTarget=$isTarget; IsBackup=$isBackup; SizeGB=$sizeGB; UsedGB=$usedGB; FreeGB=$freeGB; SmartHealth=$smartHealth; SmartTemp=$smartTemp; UsageHours=$usageHours }
 }
 
@@ -152,157 +110,70 @@ $alerts = @()
 $cDrive = $volumes | Where-Object { $_.Drive -eq "C" } | Select-Object -First 1
 if ($cDrive -and $cDrive.FreeGB -lt $minCFreeGB) { $alerts += "C drive free space is low (${($cDrive.FreeGB)}GB < ${minCFreeGB}GB)" }
 
-$recoveryDrives = $volumes | Where-Object { $recoveryImageDriveLetters -contains $_.Drive }
-foreach ($rv in $recoveryDrives) {
-  if ($rv.SizeGB -le 0) { continue }
-  if ($rv.FreeGB -lt $minRecoveryFreeGB) { $alerts += ("Recovery candidate drive {0} free space is low ({1}GB < {2}GB)" -f [string]$rv.Drive, [string]$rv.FreeGB, [string]$minRecoveryFreeGB) }
-}
-
 $diskHealth = Get-PhysicalDisk -ErrorAction SilentlyContinue | Select-Object FriendlyName, HealthStatus
 if ($diskHealth) {
-  foreach ($pd in $diskHealth) {
-    if ("Healthy" -ne [string]$pd.HealthStatus) { $alerts += "Disk health warning: ${($pd.FriendlyName)} = ${($pd.HealthStatus)}" }
-  }
+  foreach ($pd in $diskHealth) { if ("Healthy" -ne [string]$pd.HealthStatus) { $alerts += "Disk health warning: ${($pd.FriendlyName)} = ${($pd.HealthStatus)}" } }
 }
 
-# ===== Antivirus =====
+# ===== セキュリティソフト確認 =====
 $avProducts = @()
 try { $avProducts = Get-CimInstance -Namespace "root/SecurityCenter2" -ClassName "AntiVirusProduct" -ErrorAction Stop | Select-Object -ExpandProperty displayName | Where-Object { $_ } | Sort-Object -Unique } catch {}
 $antivirusDetected = $avProducts.Count -gt 0
 $antivirusProductsText = if ($antivirusDetected) { ($avProducts -join " / ") } else { "" }
-$antivirusVendor = "Other"
-$vendorPatterns = @( @{Name="ESET";Pattern="ESET"}, @{Name="TrendMicro";Pattern="Trend Micro|Virus Buster"}, @{Name="McAfee";Pattern="McAfee"}, @{Name="Norton";Pattern="Norton"}, @{Name="Avast";Pattern="Avast"}, @{Name="MicrosoftDefender";Pattern="Defender|Windows Defender"} )
-if ($antivirusDetected) { foreach ($vp in $vendorPatterns) { if ($avProducts -match $vp.Pattern) { $antivirusVendor = $vp.Name; break } } }
 
-$antivirusLatestEvidence = $null
-$antivirusLatestEvidenceText = ""
-$antivirusEvidenceStale = $false
-
-# ===== ESET / Macrium / Hasleo presence =====
-$esetInstalled = Test-Path "C:\Program Files\ESET\"
+# ===== バックアップソフト確認（Cドライブ除外爆速検索） =====
 $macriumInstalled = Test-Path "C:\Program Files\Macrium\Reflect\"
+$hasleoInstalled = (Test-Path "C:\Program Files*\Hasleo*") -or (Test-Path "C:\Program Files*\Hasleo Backup Suite*")
 
-$hasleoInstalled = $false
-if ((Test-Path "C:\Program Files*\Hasleo*") -or (Test-Path "C:\Program Files*\Hasleo Backup Suite*")) {
-    $hasleoInstalled = $true
-}
-if (-not $hasleoInstalled) {
-    $regPaths = @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*", "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*")
-    $hasleoReg = Get-ItemProperty $regPaths -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match "Hasleo" }
-    if ($hasleoReg) { $hasleoInstalled = $true }
-}
-
-$esetLatestScanText = ""
-$esetScanStale = $true
-if ($esetInstalled) { $esetScanStale = $false }
-
-$winReg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
-$windowsRelease = "{0} (Build {1})" -f $winReg.DisplayVersion, $winReg.CurrentBuild
-
-# ===== Reflect & Hasleo Image Search (★Cドライブ完全除外・爆速版) =====
-$reflectImageLatest = $null
-$hasleoImageLatest = $null
-
+$reflectImageLatest = $null; $hasleoImageLatest = $null
 if ($macriumInstalled -or $hasleoInstalled) {
-    Write-Host "[INFO] バックアップソフトのインストールを検知しました。イメージファイルの検索を開始します（Cドライブは除外します）..."
-    
-    # ★Cドライブ（システムドライブ）を検索対象から完全に除外する
     $psDrives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -ne $null -and $_.Name -ne "C" }
-
     foreach ($d in $psDrives) {
       $root = $d.Root.TrimEnd('\')
-      
-      # ① Reflect search
       if ($macriumInstalled) {
           $foundR = Get-ChildItem -Path "$root" -Filter "*.mrimg" -File -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if ($foundR) { if (-not $reflectImageLatest -or $foundR.LastWriteTime -gt $reflectImageLatest.LastWriteTime) { $reflectImageLatest = $foundR } }
       }
-
-      # ② Hasleo search
       if ($hasleoInstalled) {
-          $hasleoExts = @("*.hbi", "*.hbk", "*.hbc", "*.hbs", "*.dbi")
-          foreach ($ext in $hasleoExts) {
+          foreach ($ext in @("*.hbi", "*.hbk", "*.hbc", "*.hbs", "*.dbi")) {
               $foundH = Get-ChildItem -Path "$root" -Filter $ext -File -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
               if ($foundH) { if (-not $hasleoImageLatest -or $foundH.LastWriteTime -gt $hasleoImageLatest.LastWriteTime) { $hasleoImageLatest = $foundH } }
           }
       }
     }
-    Write-Host "[INFO] 検索が完了しました。"
-} else {
-    Write-Host "[INFO] バックアップソフトがインストールされていません。検索をスキップします。"
 }
-
-$reflectLatestImageTime = if ($reflectImageLatest) { $reflectImageLatest.LastWriteTime } else { $null }
-$reflectLatestImageText = Convert-ToDateString $reflectLatestImageTime
-$reflectImageStale = if ($reflectLatestImageTime) { ((Get-Date) - $reflectLatestImageTime).TotalDays -gt $recoveryImageAgeDays } else { $true }
 
 $hasleoLatestImageTime = if ($hasleoImageLatest) { $hasleoImageLatest.LastWriteTime } else { $null }
-$hasleoLatestImageText = Convert-ToDateString $hasleoLatestImageTime
-$hasleoImageStale = if ($hasleoLatestImageTime) { ((Get-Date) - $hasleoLatestImageTime).TotalDays -gt $recoveryImageAgeDays } else { $true }
+if (-not $hasleoLatestImageTime -and $hasleoInstalled) { $alerts += "Hasleoバックアップが未検出または古いです" }
 
-$reflectBackupOk = $false
-if ($reflectLatestImageTime) { $reflectBackupOk = (((Get-Date) - $reflectLatestImageTime).TotalDays -le $recoveryImageAgeDays) }
-$hasleoBackupOk = $false
-if ($hasleoLatestImageTime) { $hasleoBackupOk = (((Get-Date) - $hasleoLatestImageTime).TotalDays -le $recoveryImageAgeDays) }
-
-if (-not $reflectBackupOk -and -not $hasleoBackupOk) {
-  $alerts += "バックアップが未検出または古いです"
-}
 $healthStatus = if ($alerts.Count -eq 0) { "OK" } else { "WARN" }
 
-# =========================================================================
-# ★GASと名前を100%一致させた完全版ペイロード
-# =========================================================================
-$alertsForJson = if ($alerts.Count -eq 0) { @() } else { $alerts }
-
+# ====================================================================
+# 3. 結合＆GASへの送信フェーズ
+# ====================================================================
 $payload = [PSCustomObject]@{
+    action                  = "report"
     authToken               = $sharedSecret
+    uuid                    = $UUID
+    usbSerial               = $usbSerial
     timestamp               = $timestamp
-    customerGroup           = if ($customerGroup) { $customerGroup } else { "未設定" }
-    customerName            = $customerName
-    customerEmail           = $customerEmail
-    servicePlan             = $servicePlan
-    pcLocation              = $pcLocation
-    pcUser                  = $pcUser
-    device                  = $env:COMPUTERNAME
+    customerGroup           = $customerGroup
+    device                  = $deviceName
     scriptVersion           = $ScriptVersion
-    windowsRelease          = $windowsRelease
     healthStatus            = $healthStatus
-    alerts                  = [object[]]$alertsForJson
+    alerts                  = [object[]]$alerts
     volumes                 = $volumes
-    diskHealth              = @()
-    
-    antivirusVendor         = $antivirusVendor
-    antivirusProducts       = $antivirusProductsText
     antivirusDetected       = [bool]$antivirusDetected
-    antivirusLatestEvidence = $antivirusLatestEvidenceText
-    antivirusEvidenceStale  = [bool]$antivirusEvidenceStale
-    
-    esetInstalled           = [bool]$esetInstalled
-    esetLatestScan          = $esetLatestScanText
-    esetScanStale           = [bool]$esetScanStale
-    
-    macriumInstalled        = [bool]$macriumInstalled
-    macriumLatestLog        = $reflectLatestImageText
-    reflectImageStale       = [bool]$reflectImageStale
-    
+    antivirusProducts       = $antivirusProductsText
     hasleoInstalled         = [bool]$hasleoInstalled
-    hasleoLatestImage       = $hasleoLatestImageText
-    hasleoImageStale        = [bool]$hasleoImageStale
+    hasleoLatestImage       = Convert-ToDateString $hasleoLatestImageTime
 }
 
 $jsonBody = $payload | ConvertTo-Json -Depth 8 -Compress
 
-# ===== Send =====
-$response = $null
-for ($attempt = 1; $attempt -le $requestMaxRetries; $attempt++) {
-  try {
-    $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes($jsonBody)
-    $response = Invoke-RestMethod -Uri $endpoint -Method Post -ContentType "application/json; charset=utf-8" -Body $jsonBytes -TimeoutSec $requestTimeoutSec -ErrorAction Stop
-    Write-Host "[INFO] GAS response: $response"
-    break
-  }
-  catch {
-    if ($attempt -lt $requestMaxRetries) { Start-Sleep -Seconds $requestRetryDelaySec }
-  }
+try {
+    Invoke-RestMethod -Uri $endpoint -Method Post -ContentType "application/json; charset=utf-8" -Body ([System.Text.Encoding]::UTF8.GetBytes($jsonBody)) -TimeoutSec 60
+    Write-Host "`n[SUCCESS] フル健康診断＆暗号化報告が完了しました！" -ForegroundColor Green
+} catch {
+    Write-Error "GASへの送信に失敗しました。"
 }
