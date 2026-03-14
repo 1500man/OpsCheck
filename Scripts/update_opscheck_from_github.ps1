@@ -1,11 +1,13 @@
 # ===================================================
-# Virgo Premium - Secure Auto Updater (v1.1)
+# Virgo Premium - Secure Auto Updater (v1.2 本番用)
 # ===================================================
 $ErrorActionPreference = 'Continue'
 $TargetDir = "C:\OpsCheck\Scripts"
+
 $RepoOwner = "1500man"
 $RepoName = "OpsCheck"
 $Branch = "main"
+$SubFolder = "Scripts" # GitHub上のフォルダ指定
 
 # 1. 要塞解錠フェーズ（金庫からGitHubトークンを取り出す）
 $MasterKey = [Environment]::GetEnvironmentVariable("VIRGO_MASTER_KEY", "Machine")
@@ -27,16 +29,15 @@ try {
 } catch { exit } 
 finally { if ($null -ne $BSTR -and $BSTR -ne [IntPtr]::Zero) { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR) } }
 
-# 金庫からトークンを取得！
 $GitHubToken = $Config.githubToken
 if ([string]::IsNullOrEmpty($GitHubToken)) { exit }
 
-# 2. GitHubからのダウンロード処理
+# 2. GitHubからのサイレント・ダウンロード処理
 $FilesToSync = @("poc_health_report.ps1", "update_opscheck_from_github.ps1")
 $Headers = @{ "Authorization" = "token $GitHubToken" }
 
 foreach ($file in $FilesToSync) {
-    $Url = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/$file"
+    $Url = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/$SubFolder/$file"
     $DestPath = Join-Path $TargetDir $file
     try {
         Invoke-RestMethod -Uri $Url -Headers $Headers -OutFile $DestPath -UseBasicParsing
