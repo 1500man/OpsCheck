@@ -1,5 +1,5 @@
 ﻿# ===================================================
-# Virgo Premium - Health Report (V3.3 本番サイレント版)
+# Virgo Premium - Health Report (V3.9 本番ストレージ取得版)
 # ===================================================
 $ErrorActionPreference = 'SilentlyContinue'
 $TargetDir = "C:\OpsCheck\Scripts"
@@ -33,6 +33,24 @@ $DiskFreeGB = [math]::Round($Disk.FreeSpace / 1GB, 2)
 $OS = Get-WmiObject Win32_OperatingSystem
 $MemFreeGB = [math]::Round($OS.FreePhysicalMemory / 1MB, 2)
 
+# ★ 追加：ダッシュボード用のドライブ容量情報を取得する
+$Volumes = @()
+$LogicalDisks = Get-WmiObject Win32_LogicalDisk -Filter "DriveType=3"
+foreach ($d in $LogicalDisks) {
+    $size = [math]::Round($d.Size / 1GB, 1)
+    $free = [math]::Round($d.FreeSpace / 1GB, 1)
+    $used = $size - $free
+    $Volumes += @{
+        Drive       = $d.DeviceID.Replace(":", "")
+        SizeGB      = $size
+        UsedGB      = $used
+        SmartHealth = "正常"
+        SmartTemp   = "--"
+        UsageHours  = "--"
+        IsTarget    = ($d.DeviceID -eq "C:")
+    }
+}
+
 $ScriptPath = Join-Path $TargetDir "poc_health_report.ps1"
 $ScriptHash = "UNKNOWN"
 if (Test-Path $ScriptPath) {
@@ -51,8 +69,7 @@ $Payload = @{
     memFreeGB     = $MemFreeGB
     scriptHash    = $ScriptHash
     authToken     = $Config.authToken
-    # GASの受け取り拒否を回避するための必須項目
-    volumes       = @()
+    volumes       = $Volumes  # ★ 空っぽの @() をやめて、取得した情報をセット
     diskHealth    = @()
     alerts        = @()
     healthStatus  = "正常"
@@ -60,7 +77,4 @@ $Payload = @{
 
 try {
     Invoke-RestMethod -Uri $Config.endpoint -Method Post -ContentType "application/json" -Body ([System.Text.Encoding]::UTF8.GetBytes($Payload))
-} catch {
-    # エラー時も何も表示せずに静かに終了（翌日の報告を待つ）
-    exit
-}
+} catch {}
