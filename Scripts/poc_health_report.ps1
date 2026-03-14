@@ -1,5 +1,5 @@
 ﻿# ===================================================
-# Virgo Premium - Health Report (V3.9 本番ストレージ取得版)
+# Virgo Premium - Health Report (V3.10 ドライブ完全取得版)
 # ===================================================
 $ErrorActionPreference = 'SilentlyContinue'
 $TargetDir = "C:\OpsCheck\Scripts"
@@ -33,21 +33,23 @@ $DiskFreeGB = [math]::Round($Disk.FreeSpace / 1GB, 2)
 $OS = Get-WmiObject Win32_OperatingSystem
 $MemFreeGB = [math]::Round($OS.FreePhysicalMemory / 1MB, 2)
 
-# ★ 追加：ダッシュボード用のドライブ容量情報を取得する
+# ★ 全ドライブ（内蔵・USB等）の容量情報を取得
 $Volumes = @()
-$LogicalDisks = Get-WmiObject Win32_LogicalDisk -Filter "DriveType=3"
+$LogicalDisks = Get-WmiObject Win32_LogicalDisk -Filter "DriveType=2 OR DriveType=3"
 foreach ($d in $LogicalDisks) {
-    $size = [math]::Round($d.Size / 1GB, 1)
-    $free = [math]::Round($d.FreeSpace / 1GB, 1)
-    $used = $size - $free
-    $Volumes += @{
-        Drive       = $d.DeviceID.Replace(":", "")
-        SizeGB      = $size
-        UsedGB      = $used
-        SmartHealth = "正常"
-        SmartTemp   = "--"
-        UsageHours  = "--"
-        IsTarget    = ($d.DeviceID -eq "C:")
+    if ($d.Size -gt 0) {
+        $size = [math]::Round($d.Size / 1GB, 1)
+        $free = [math]::Round($d.FreeSpace / 1GB, 1)
+        $used = $size - $free
+        $Volumes += @{
+            Drive       = $d.DeviceID.Replace(":", "")
+            SizeGB      = $size
+            UsedGB      = $used
+            SmartHealth = "正常" # フル版統合までのダミー
+            SmartTemp   = "--"   # フル版統合までのダミー
+            UsageHours  = "--"   # フル版統合までのダミー
+            IsTarget    = $true  # すべてのドライブをダッシュボードに表示
+        }
     }
 }
 
@@ -69,7 +71,7 @@ $Payload = @{
     memFreeGB     = $MemFreeGB
     scriptHash    = $ScriptHash
     authToken     = $Config.authToken
-    volumes       = $Volumes  # ★ 空っぽの @() をやめて、取得した情報をセット
+    volumes       = $Volumes  # 取得した全ドライブ情報をセット
     diskHealth    = @()
     alerts        = @()
     healthStatus  = "正常"
