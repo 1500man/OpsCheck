@@ -12,6 +12,10 @@ Virgo Premium V3 プロジェクト・マニフェスト（設計図）
 $ErrorActionPreference = 'SilentlyContinue'
 $TargetDir = "C:\OpsCheck\Scripts"
 
+# 0. 通信分散（ジッター）フェーズ：GASの同時実行パンクを防ぐため最大5分待機
+$JitterSeconds = Get-Random -Minimum 1 -Maximum 300
+Start-Sleep -Seconds $JitterSeconds
+
 # 1. 要塞解錠（ MasterKey + UUID ）
 $MasterKey = [Environment]::GetEnvironmentVariable("VIRGO_MASTER_KEY", "Machine")
 $UUID = (Get-WmiObject Win32_ComputerSystemProduct).UUID
@@ -38,7 +42,7 @@ $HealthStatus = "正常"
 $AvProducts = Get-WmiObject -Namespace "root\SecurityCenter2" -Class AntiVirusProduct
 $AvVendor = if ($AvProducts) { ($AvProducts | Select-Object -ExpandProperty displayName) -join ", " } else { "Defender/未検出" }
 
-# ドライブ厳選 ＆ S.M.A.R.T.
+# ドライブ厳選 ＆ WMI簡易S.M.A.R.T.
 $Volumes = @()
 $LogicalDisks = Get-WmiObject Win32_LogicalDisk -Filter "DriveType=2 OR DriveType=3"
 $DiskDrives = Get-WmiObject Win32_DiskDrive
@@ -68,6 +72,45 @@ foreach ($d in $LogicalDisks) {
     }
 }
 
+# ★【復元】S.M.A.R.T. 詳細監視 (smartmontools連携)
+$DiskHealth = @()
+$SmartCtlPath = ""
+if (Get-Command "smartctl" -ErrorAction SilentlyContinue) { $SmartCtlPath = "smartctl" }
+elseif (Test-Path "${env:ProgramFiles}\smartmontools\bin\smartctl.exe") { $SmartCtlPath = "${env:ProgramFiles}\smartmontools\bin\smartctl.exe" }
+elseif (Test-Path "${env:ProgramFiles(x86)}\smartmontools\bin\smartctl.exe") { $SmartCtlPath = "${env:ProgramFiles(x86)}\smartmontools\bin\smartctl.exe" }
+
+if ($SmartCtlPath) {
+    foreach ($pd in $DiskDrives) {
+        $diskInfo = @{
+            Model = $pd.Model
+            Status = "不明"
+            Temperature = "不明"
+            PowerOnHours = "不明"
+        }
+        $smartOutput = & $SmartCtlPath -a $pd.DeviceID 2>$null
+        if ($smartOutput) {
+            if ($smartOutput -match "SMART overall-health self-assessment test result: (.*)") {
+                $diskInfo.Status = $matches[1].Trim()
+                if ($diskInfo.Status -ne "PASSED") { $Alerts += "[$($pd.Model)] S.M.A.R.T.異常" }
+            } elseif ($smartOutput -match "SMART Health Status: (.*)") {
+                $diskInfo.Status = $matches[1].Trim()
+                if ($diskInfo.Status -ne "OK") { $Alerts += "[$($pd.Model)] S.M.A.R.T.異常" }
+            }
+            if ($smartOutput -match "(?i)Temperature_Celsius[\s\S]*?-\s+(\d+)") {
+                $diskInfo.Temperature = $matches[1]
+            } elseif ($smartOutput -match "(?i)Temperature:\s+(\d+) Celsius") {
+                $diskInfo.Temperature = $matches[1]
+            }
+            if ($smartOutput -match "(?i)Power_On_Hours[\s\S]*?-\s+(\d+)") {
+                $diskInfo.PowerOnHours = $matches[1]
+            }
+        }
+        $DiskHealth += $diskInfo
+    }
+} else {
+    $Alerts += "smartmontools未検出"
+}
+
 # バックアップ鮮度(14日)
 $MacriumFile = Get-ChildItem -Path "C:\", "D:\", "E:\", "F:\", "G:\" -Filter "*.mrimg" -Recurse -Depth 3 | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 $MacriumTime = if ($MacriumFile) { $MacriumFile.LastWriteTime } else { $null }
@@ -86,9 +129,10 @@ $Payload = @{
     scriptHash        = $ScriptHash
     authToken         = $Config.authToken
     antivirusVendor   = $AvVendor
-    lastUpdate        = $Timestamp # HTML要求名
-    alerts            = $Alerts    # HTML要求名
-    volumes           = $Volumes   # HTML要求名
+    lastUpdate        = $Timestamp 
+    alerts            = $Alerts    
+    volumes           = $Volumes   
+    diskHealth        = $DiskHealth # ★追加：ダッシュボード用SMART情報
     healthStatus      = $HealthStatus
 } | ConvertTo-Json -Depth 5 -Compress
 
