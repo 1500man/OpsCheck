@@ -11,6 +11,7 @@ Virgo Premium V3 プロジェクト・マニフェスト（設計図）
 #>
 $ErrorActionPreference = 'SilentlyContinue'
 $TargetDir = "C:\OpsCheck\Scripts"
+$ScriptVersion = "3.16" # ★追加: スクリプトバージョンの明記
 
 # 0. 通信分散（ジッター）フェーズ：GASの同時実行パンクを防ぐため最大5分待機
 $JitterSeconds = Get-Random -Minimum 1 -Maximum 300
@@ -42,7 +43,7 @@ $HealthStatus = "正常"
 $AvProducts = Get-WmiObject -Namespace "root\SecurityCenter2" -Class AntiVirusProduct
 $AvVendor = if ($AvProducts) { ($AvProducts | Select-Object -ExpandProperty displayName) -join ", " } else { "Defender/未検出" }
 
-# ドライブ厳選 ＆ WMI簡易S.M.A.R.T.
+# ドライブ厳選 ＆ S.M.A.R.T. (簡易WMI版)
 $Volumes = @()
 $LogicalDisks = Get-WmiObject Win32_LogicalDisk -Filter "DriveType=2 OR DriveType=3"
 $DiskDrives = Get-WmiObject Win32_DiskDrive
@@ -72,7 +73,7 @@ foreach ($d in $LogicalDisks) {
     }
 }
 
-# ★【復元】S.M.A.R.T. 詳細監視 (smartmontools連携)
+# ★【最終形態】S.M.A.R.T. 詳細監視 (smartmontools連携: JSON確実解析版)
 $DiskHealth = @()
 $SmartCtlPath = ""
 if (Get-Command "smartctl" -ErrorAction SilentlyContinue) { $SmartCtlPath = "smartctl" }
@@ -87,23 +88,35 @@ if ($SmartCtlPath) {
             Temperature = "不明"
             PowerOnHours = "不明"
         }
-        $smartOutput = & $SmartCtlPath -a $pd.DeviceID 2>$null
+        
+        # -j オプションを付与し、完全なJSONデータとして出力を受け取る
+        $smartOutput = & $SmartCtlPath -a $pd.DeviceID -j 2>$null
         if ($smartOutput) {
-            if ($smartOutput -match "SMART overall-health self-assessment test result: (.*)") {
-                $diskInfo.Status = $matches[1].Trim()
-                if ($diskInfo.Status -ne "PASSED") { $Alerts += "[$($pd.Model)] S.M.A.R.T.異常" }
-            } elseif ($smartOutput -match "SMART Health Status: (.*)") {
-                $diskInfo.Status = $matches[1].Trim()
-                if ($diskInfo.Status -ne "OK") { $Alerts += "[$($pd.Model)] S.M.A.R.T.異常" }
+            try {
+                $jsonStr = $smartOutput -join "`n"
+                $smartData = $jsonStr | ConvertFrom-Json
+                
+                # 1. ステータス判定
+                if ($null -ne $smartData.smart_status.passed) {
+                    if ($smartData.smart_status.passed -eq $true) { $diskInfo.Status = "PASSED" }
+                    else { $diskInfo.Status = "FAILED" }
+                }
+
+                # 2. 温度の取得
+                if ($null -ne $smartData.temperature.current) {
+                    $diskInfo.Temperature = $smartData.temperature.current
+                }
+
+                # 3. 稼働時間の取得
+                if ($null -ne $smartData.power_on_time.hours) {
+                    $diskInfo.PowerOnHours = $smartData.power_on_time.hours
+                }
+
+            } catch {
+                # ドライブが非対応でパース失敗した場合は「不明」のままスキップ
             }
-            if ($smartOutput -match "(?i)Temperature_Celsius[\s\S]*?-\s+(\d+)") {
-                $diskInfo.Temperature = $matches[1]
-            } elseif ($smartOutput -match "(?i)Temperature:\s+(\d+) Celsius") {
-                $diskInfo.Temperature = $matches[1]
-            }
-            if ($smartOutput -match "(?i)Power_On_Hours[\s\S]*?-\s+(\d+)") {
-                $diskInfo.PowerOnHours = $matches[1]
-            }
+            
+            if ($diskInfo.Status -notin @("PASSED", "OK", "不明")) { $Alerts += "[$($pd.Model)] S.M.A.R.T.異常" }
         }
         $DiskHealth += $diskInfo
     }
@@ -127,12 +140,13 @@ $Payload = @{
     timestamp         = $Timestamp
     diskFreeGB        = $DiskFreeGB
     scriptHash        = $ScriptHash
+    scriptVersion     = $ScriptVersion # ★追加: ペイロードへの組み込み
     authToken         = $Config.authToken
     antivirusVendor   = $AvVendor
-    lastUpdate        = $Timestamp 
-    alerts            = $Alerts    
-    volumes           = $Volumes   
-    diskHealth        = $DiskHealth # ★追加：ダッシュボード用SMART情報
+    lastUpdate        = $Timestamp
+    alerts            = $Alerts
+    volumes           = $Volumes
+    diskHealth        = $DiskHealth
     healthStatus      = $HealthStatus
 } | ConvertTo-Json -Depth 5 -Compress
 
