@@ -11,7 +11,7 @@ Virgo Premium V3 プロジェクト・マニフェスト（設計図）
 #>
 $ErrorActionPreference = 'SilentlyContinue'
 $TargetDir = "C:\OpsCheck\Scripts"
-$ScriptVersion = "3.16" # ★追加: スクリプトバージョンの明記
+$ScriptVersion = "3.17"
 
 # 0. 通信分散（ジッター）フェーズ：GASの同時実行パンクを防ぐため最大5分待機
 $JitterSeconds = Get-Random -Minimum 1 -Maximum 300
@@ -73,7 +73,7 @@ foreach ($d in $LogicalDisks) {
     }
 }
 
-# ★【最終形態】S.M.A.R.T. 詳細監視 (smartmontools連携: JSON確実解析版)
+# ★【真・最終形態】S.M.A.R.T. 詳細監視 (テキスト解析＆SATA/NVMe完全対応版)
 $DiskHealth = @()
 $SmartCtlPath = ""
 if (Get-Command "smartctl" -ErrorAction SilentlyContinue) { $SmartCtlPath = "smartctl" }
@@ -89,33 +89,31 @@ if ($SmartCtlPath) {
             PowerOnHours = "不明"
         }
         
-        # -j オプションを付与し、完全なJSONデータとして出力を受け取る
-        $smartOutput = & $SmartCtlPath -a $pd.DeviceID -j 2>$null
+        # Windowsの物理ドライブパスを smartmontools の推奨形式に変換 (例: \\.\PHYSICALDRIVE0 -> /dev/pd0)
+        $pdNum = $pd.DeviceID -replace '\D', ''
+        $smartDevice = "/dev/pd$pdNum"
+
+        # -jを廃止し、最も確実なテキスト出力を取得
+        $smartOutput = & $SmartCtlPath -a $smartDevice 2>$null
+        
         if ($smartOutput) {
-            try {
-                $jsonStr = $smartOutput -join "`n"
-                $smartData = $jsonStr | ConvertFrom-Json
+            foreach ($line in $smartOutput) {
+                $line = $line.Trim()
+                # ステータス判定
+                if ($line -match "SMART overall-health self-assessment test result:\s*(.*)") { $diskInfo.Status = $matches[1] }
+                if ($line -match "SMART Health Status:\s*(.*)") { $diskInfo.Status = $matches[1] }
                 
-                # 1. ステータス判定
-                if ($null -ne $smartData.smart_status.passed) {
-                    if ($smartData.smart_status.passed -eq $true) { $diskInfo.Status = "PASSED" }
-                    else { $diskInfo.Status = "FAILED" }
+                # NVMe情報の取得
+                if ($line -match "^Temperature:\s+(\d+)\s*Celsius") { $diskInfo.Temperature = $matches[1] }
+                if ($line -match "^Power On Hours:\s+([\d,]+)") { $diskInfo.PowerOnHours = $matches[1].Replace(",", "") }
+                
+                # SATA情報の取得 (スペース区切りで確実に10列目を狙い撃ち)
+                $parts = $line -split '\s+'
+                if ($parts.Count -ge 10) {
+                    if ($parts[0] -eq "194" -and $parts[1] -match "Temperature") { $diskInfo.Temperature = $parts[9] }
+                    if ($parts[0] -eq "9" -and $parts[1] -match "Power_On_Hours") { $diskInfo.PowerOnHours = $parts[9] }
                 }
-
-                # 2. 温度の取得
-                if ($null -ne $smartData.temperature.current) {
-                    $diskInfo.Temperature = $smartData.temperature.current
-                }
-
-                # 3. 稼働時間の取得
-                if ($null -ne $smartData.power_on_time.hours) {
-                    $diskInfo.PowerOnHours = $smartData.power_on_time.hours
-                }
-
-            } catch {
-                # ドライブが非対応でパース失敗した場合は「不明」のままスキップ
             }
-            
             if ($diskInfo.Status -notin @("PASSED", "OK", "不明")) { $Alerts += "[$($pd.Model)] S.M.A.R.T.異常" }
         }
         $DiskHealth += $diskInfo
@@ -140,7 +138,7 @@ $Payload = @{
     timestamp         = $Timestamp
     diskFreeGB        = $DiskFreeGB
     scriptHash        = $ScriptHash
-    scriptVersion     = $ScriptVersion # ★追加: ペイロードへの組み込み
+    scriptVersion     = $ScriptVersion
     authToken         = $Config.authToken
     antivirusVendor   = $AvVendor
     lastUpdate        = $Timestamp
