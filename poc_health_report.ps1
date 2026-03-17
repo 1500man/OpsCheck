@@ -72,7 +72,7 @@ foreach ($d in $LogicalDisks) {
     }
 }
 
-# ★【復元】S.M.A.R.T. 詳細監視 (smartmontools連携: SATA/NVMe両対応)
+# ★【最終形態】S.M.A.R.T. 詳細監視 (smartmontools連携: JSON確実解析版)
 $DiskHealth = @()
 $SmartCtlPath = ""
 if (Get-Command "smartctl" -ErrorAction SilentlyContinue) { $SmartCtlPath = "smartctl" }
@@ -87,24 +87,34 @@ if ($SmartCtlPath) {
             Temperature = "不明"
             PowerOnHours = "不明"
         }
-        # 出力を配列として受け取り、1行ずつ確実に解析する
-        $smartOutputArray = & $SmartCtlPath -a $pd.DeviceID 2>$null
-        if ($smartOutputArray) {
-            foreach ($line in $smartOutputArray) {
-                if ($line -match "SMART overall-health self-assessment test result:\s*(.*)") {
-                    $diskInfo.Status = $matches[1].Trim()
-                } elseif ($line -match "SMART Health Status:\s*(.*)") {
-                    $diskInfo.Status = $matches[1].Trim()
-                } elseif ($line -match "Temperature_Celsius.*-\s+(\d+)(\s|$)") {
-                    $diskInfo.Temperature = $matches[1]
-                } elseif ($line -match "Temperature:\s+(\d+) Celsius") {
-                    $diskInfo.Temperature = $matches[1]
-                } elseif ($line -match "Power_On_Hours.*-\s+(\d+)(\s|$)") {
-                    $diskInfo.PowerOnHours = $matches[1]
-                } elseif ($line -match "Power On Hours:\s+([\d,]+)") {
-                    $diskInfo.PowerOnHours = $matches[1].Replace(",", "")
+        
+        # -j オプションを付与し、完全なJSONデータとして出力を受け取る
+        $smartOutput = & $SmartCtlPath -a $pd.DeviceID -j 2>$null
+        if ($smartOutput) {
+            try {
+                $jsonStr = $smartOutput -join "`n"
+                $smartData = $jsonStr | ConvertFrom-Json
+                
+                # 1. ステータス判定
+                if ($null -ne $smartData.smart_status.passed) {
+                    if ($smartData.smart_status.passed -eq $true) { $diskInfo.Status = "PASSED" }
+                    else { $diskInfo.Status = "FAILED" }
                 }
+
+                # 2. 温度の取得
+                if ($null -ne $smartData.temperature.current) {
+                    $diskInfo.Temperature = $smartData.temperature.current
+                }
+
+                # 3. 稼働時間の取得
+                if ($null -ne $smartData.power_on_time.hours) {
+                    $diskInfo.PowerOnHours = $smartData.power_on_time.hours
+                }
+
+            } catch {
+                # ドライブが非対応でパース失敗した場合は「不明」のままスキップ
             }
+            
             if ($diskInfo.Status -notin @("PASSED", "OK", "不明")) { $Alerts += "[$($pd.Model)] S.M.A.R.T.異常" }
         }
         $DiskHealth += $diskInfo
@@ -134,7 +144,7 @@ $Payload = @{
     lastUpdate        = $Timestamp
     alerts            = $Alerts
     volumes           = $Volumes
-    diskHealth        = $DiskHealth  # ★追加：ダッシュボード用SMART情報
+    diskHealth        = $DiskHealth
     healthStatus      = $HealthStatus
 } | ConvertTo-Json -Depth 5 -Compress
 
