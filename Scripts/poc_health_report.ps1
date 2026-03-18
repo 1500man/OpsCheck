@@ -11,7 +11,7 @@ Virgo Premium V3 プロジェクト・マニフェスト（設計図）
 #>
 $ErrorActionPreference = 'SilentlyContinue'
 $TargetDir = "C:\OpsCheck\Scripts"
-$ScriptVersion = "3.17"
+$ScriptVersion = "3.18"
 
 # 0. 通信分散（ジッター）フェーズ：GASの同時実行パンクを防ぐため最大5分待機
 $JitterSeconds = Get-Random -Minimum 1 -Maximum 300
