@@ -1,37 +1,42 @@
 ﻿<#
 ===================================================
-Virgo Premium V3 プロジェクト・マニフェスト（設計図）
+Virgo Standard/Lite プロジェクト・マニフェスト
 ===================================================
-【設計思想】PCにパスワードを持たせず、改ざんを許さない最高強度の監視。
-【AI(Gemini)への絶対命令】
+【設計思想】DPAPIによる秘密鍵保護と、HMAC-SHA256署名によるゼロトラスト通信。
+【AIへの絶対命令】
 - 監視ドライブは「C:」と「バックアップイメージが存在するドライブ」のみに限定せよ。
 - S.M.A.R.T.、AV監視、バックアップ鮮度(14日)のロジックを1文字も削るな。
 - 改ざん検知用のハッシュ計算を省略するな。
 ===================================================
 #>
 $ErrorActionPreference = 'SilentlyContinue'
-$TargetDir = "C:\OpsCheck\Scripts"
-$ScriptVersion = "3.18"
+$TargetDir = "C:\OpsCheck"
+$ScriptVersion = "4.0.0"
 
 # 0. 通信分散（ジッター）フェーズ：GASの同時実行パンクを防ぐため最大5分待機
 $JitterSeconds = Get-Random -Minimum 1 -Maximum 300
 Start-Sleep -Seconds $JitterSeconds
 
-# 1. 要塞解錠（ MasterKey + UUID ）
-$MasterKey = [Environment]::GetEnvironmentVariable("VIRGO_MASTER_KEY", "Machine")
+# 1. 要塞解錠（環境変数 ＆ DPAPI復号）
+$CustomerGroup = [Environment]::GetEnvironmentVariable("VIRGO_CUSTOMER_GROUP", "Machine")
+$Endpoint = [Environment]::GetEnvironmentVariable("VIRGO_ENDPOINT", "Machine")
 $UUID = (Get-WmiObject Win32_ComputerSystemProduct).UUID
-$EncFile = Join-Path $TargetDir "system_config.enc"
 
-$EncryptedText = Get-Content $EncFile -Raw
-$Hasher = [System.Security.Cryptography.SHA256]::Create()
-$KeyBytes = $Hasher.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$MasterKey-$UUID"))
+# 万が一環境変数が取れない場合は安全に終了
+if ([string]::IsNullOrEmpty($Endpoint) -or [string]::IsNullOrEmpty($CustomerGroup)) { exit }
+
+# DPAPIから「端末専用シークレット」を復号
+Add-Type -AssemblyName System.Security
+$DpapiFile = Join-Path $TargetDir "config.dpapi"
+if (-not (Test-Path $DpapiFile)) { exit }
 
 try {
-    $SecureString = $EncryptedText | ConvertTo-SecureString -Key $KeyBytes
-    $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
-    $Config = ([System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)) | ConvertFrom-Json
-} catch { exit } 
-finally { if ($null -ne $BSTR) { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR) } }
+    $EncryptedBytes = [System.IO.File]::ReadAllBytes($DpapiFile)
+    $DecryptedBytes = [System.Security.Cryptography.ProtectedData]::Unprotect($EncryptedBytes, $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
+    $DeviceSecret = [System.Text.Encoding]::UTF8.GetString($DecryptedBytes)
+} catch {
+    exit # 復号失敗時（別のPCにコピーされた等）は沈黙して終了
+}
 
 # 2. 診断フェーズ
 $HostName = $env:COMPUTERNAME
@@ -127,25 +132,53 @@ $MacriumFile = Get-ChildItem -Path "C:\", "D:\", "E:\", "F:\", "G:\" -Filter "*.
 $MacriumTime = if ($MacriumFile) { $MacriumFile.LastWriteTime } else { $null }
 if ($MacriumTime -and ((Get-Date) - $MacriumTime).TotalDays -gt 14) { $Alerts += "Reflectバックアップ遅延" }
 
-# 3. 報告フェーズ
+# 3. 報告・暗号化フェーズ
 if ($Alerts.Count -gt 0) { $HealthStatus = "警告" }
 $ScriptHash = (Get-FileHash -Path (Join-Path $TargetDir "poc_health_report.ps1") -Algorithm SHA256).Hash
 
-$Payload = @{
-    action            = "report"
-    customerGroup     = $Config.customerGroup
-    device            = $HostName
-    timestamp         = $Timestamp
-    diskFreeGB        = $DiskFreeGB
-    scriptHash        = $ScriptHash
-    scriptVersion     = $ScriptVersion
-    authToken         = $Config.authToken
-    antivirusVendor   = $AvVendor
-    lastUpdate        = $Timestamp
-    alerts            = $Alerts
-    volumes           = $Volumes
-    diskHealth        = $DiskHealth
-    healthStatus      = $HealthStatus
+# ① 本来送りたい監視データの中身（インナーペイロード）
+$InnerPayload = @{
+    customerGroup   = $CustomerGroup
+    device          = $HostName
+    uuid            = $UUID
+    timestamp       = $Timestamp
+    diskFreeGB      = $DiskFreeGB
+    scriptHash      = $ScriptHash
+    scriptVersion   = $ScriptVersion
+    antivirusVendor = $AvVendor
+    alerts          = $Alerts
+    volumes         = $Volumes
+    diskHealth      = $DiskHealth
+    healthStatus    = $HealthStatus
 } | ConvertTo-Json -Depth 5 -Compress
 
-try { Invoke-RestMethod -Uri $Config.endpoint -Method Post -ContentType "application/json" -Body ([System.Text.Encoding]::UTF8.GetBytes($Payload)) } catch {}
+# ② 中身をBase64に変換（データ形式を崩さないため）
+$PayloadBytes = [System.Text.Encoding]::UTF8.GetBytes($InnerPayload)
+$PayloadBase64 = [Convert]::ToBase64String($PayloadBytes)
+
+# ③ リプレイ攻撃防止用のタイムスタンプとノンス（使い捨て文字列）を生成
+$UnixTimestamp = [Math]::Floor([datetimeoffset]::UtcNow.ToUnixTimeSeconds())
+$Nonce = [guid]::NewGuid().ToString()
+
+# ④ 署名（ハンコ）の作成： "UUID|時間|ノンス|データ" を秘密鍵でHMAC-SHA256計算
+$SignData = "$UUID|$UnixTimestamp|$Nonce|$PayloadBase64"
+$HMAC = New-Object System.Security.Cryptography.HMACSHA256
+$HMAC.Key = [System.Text.Encoding]::UTF8.GetBytes($DeviceSecret)
+$HashBytes = $HMAC.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($SignData))
+$Signature = [Convert]::ToBase64String($HashBytes)
+$HMAC.Dispose()
+
+# ⑤ 最終的にGASへ送信する「封筒（アウターペイロード）」
+$FinalPayload = @{
+    signature     = $Signature
+    uuid          = $UUID
+    timestamp     = $UnixTimestamp
+    nonce         = $Nonce
+    payloadBase64 = $PayloadBase64
+} | ConvertTo-Json -Compress
+
+# GASへ送信
+try { 
+    $BodyBytes = [System.Text.Encoding]::UTF8.GetBytes($FinalPayload)
+    Invoke-RestMethod -Uri $Endpoint -Method Post -ContentType "application/json; charset=utf-8" -Body $BodyBytes 
+} catch {}
