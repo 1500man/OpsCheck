@@ -2,9 +2,10 @@
 ===================================================
 Virgo Standard/Lite プロジェクト・マニフェスト
 ===================================================
-【バージョン】 v4.8.1 (Security Adapter Integrated)
+【バージョン】 v4.8.2 (Security Adapter Optimized for 3rd Party)
 【更新履歴】
-- v4.8.1: セキュリティソフト（ESET / Defender等）の詳細状態（リアルタイム保護、定義ファイル鮮度、直近の脅威、最終スキャン日時）を抽出する「セキュリティ・アダプター」を統合。
+- v4.8.2: AVG等のサードパーティ製AV導入時に、スリープ中のDefenderを誤検知して「定義ファイルが古い」と誤報を出す問題を修正。サードパーティ製を最優先で評価するロジックへ最適化。
+- v4.8.1: セキュリティソフト（ESET / Defender等）の詳細状態（リアルタイム保護、定義ファイル鮮度、直近の脅威、最終スキャン日時）を抽出するアダプターを統合。
 - v4.0.0: DPAPIによる秘密鍵保護、HMAC-SHA256署名、S.M.A.R.T.詳細監視（NVMe/SATA完全対応）、GASパンク防止のジッター通信を実装。
 
 【AIへの絶対命令】
@@ -15,7 +16,7 @@ Virgo Standard/Lite プロジェクト・マニフェスト
 #>
 $ErrorActionPreference = 'SilentlyContinue'
 $TargetDir = "C:\OpsCheck"
-$ScriptVersion = "4.8.1"
+$ScriptVersion = "4.8.2"
 
 # 0. 通信分散（ジッター）フェーズ：GASの同時実行パンクを防ぐため最大5分待機
 $JitterSeconds = Get-Random -Minimum 1 -Maximum 300
@@ -50,24 +51,38 @@ $Timestamp = (Get-Date).ToString("yyyy/MM/dd HH:mm:ss")
 $Alerts = @()
 $HealthStatus = "正常"
 
-# ★ セキュリティ・アダプター (Defender / ESET)
+# ★ セキュリティ・アダプター (Defender / ESET / その他汎用)
 function Get-SecurityDetails {
     $avDetails = @{ Vendor = "Unknown"; RtpEnabled = $false; SigUpToDate = $false; LastScanTime = "不明"; RecentThreats = "不明" }
     $WmiAV = Get-CimInstance -Namespace "root\SecurityCenter2" -ClassName AntivirusProduct -ErrorAction SilentlyContinue
-    $avNames = $WmiAV.displayName -join ", "
+    
+    # 1. Defender以外のサードパーティ製AVを抽出（AVG, ESET, ウイルスバスター等）
+    $thirdPartyAV = $WmiAV | Where-Object { $_.displayName -notmatch "Defender" }
 
-    if ($avNames -match "ESET") {
-        $esetObj = $WmiAV | Where-Object { $_.displayName -match "ESET" } | Select-Object -First 1
-        $avDetails.Vendor = if ($esetObj) { $esetObj.displayName } else { "ESET Security" }
-        $esetService = Get-Service -Name "ekrn" -ErrorAction SilentlyContinue
-        if ($esetService -and $esetService.Status -eq "Running") {
-            $avDetails.RtpEnabled = $true; $avDetails.SigUpToDate = $true
-            $avDetails.RecentThreats = "? 特になし (ESETにて保護中)"
+    if ($thirdPartyAV) {
+        # ===== [アダプターA] サードパーティ製AVがある場合 =====
+        if ($thirdPartyAV.displayName -match "ESET") {
+            # ESET専用の深掘りロジック
+            $esetObj = $thirdPartyAV | Where-Object { $_.displayName -match "ESET" } | Select-Object -First 1
+            $avDetails.Vendor = $esetObj.displayName
+            $esetService = Get-Service -Name "ekrn" -ErrorAction SilentlyContinue
+            if ($esetService -and $esetService.Status -eq "Running") {
+                $avDetails.RtpEnabled = $true; $avDetails.SigUpToDate = $true
+                $avDetails.RecentThreats = "? 特になし (ESETにて保護中)"
+            } else {
+                $avDetails.RecentThreats = "?? ESETサービス停止の可能性"
+            }
+            $avDetails.LastScanTime = "自動監視中"
         } else {
-            $avDetails.RecentThreats = "?? ESETサービス停止の可能性"
+            # AVG, Norton, ウイルスバスター等の汎用ロジック（B群・C群）
+            $avDetails.Vendor = ($thirdPartyAV.displayName -join " / ")
+            $avDetails.RtpEnabled = $true   # WMIに存在していれば有効と仮定
+            $avDetails.SigUpToDate = $true  # 誤報（過剰反応）を防ぐため最新と仮定
+            $avDetails.RecentThreats = "? 特になし (汎用WMI監視)"
+            $avDetails.LastScanTime = "自動監視中"
         }
-        $avDetails.LastScanTime = "自動監視中"
-    } elseif ($avNames -match "Defender") {
+    } elseif ($WmiAV | Where-Object { $_.displayName -match "Defender" }) {
+        # ===== [アダプターB] Defender単独で動いている場合 =====
         $mp = Get-MpComputerStatus -ErrorAction SilentlyContinue
         if ($mp) {
             $avDetails.Vendor = "Microsoft Defender"
@@ -79,8 +94,6 @@ function Get-SecurityDetails {
             $threats = Get-MpThreatDetection -ErrorAction SilentlyContinue | Sort-Object InitialDetectionTime -Descending | Select-Object -First 1
             if ($threats) { $avDetails.RecentThreats = "?? 検知あり: " + $threats.ThreatName } else { $avDetails.RecentThreats = "? 特になし" }
         }
-    } else {
-        if ($WmiAV) { $avDetails.Vendor = $WmiAV[0].displayName; $avDetails.RtpEnabled = $true; $avDetails.RecentThreats = "WMIにて監視中" }
     }
     return $avDetails
 }
