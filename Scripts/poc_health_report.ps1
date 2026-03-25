@@ -1,11 +1,13 @@
 ﻿#requires -Version 5.1
 <#
-Virgo Standard V4 - poc_health_report.ps1
-- S.M.A.R.T. / セキュリティ / バックアップ鮮度を収集
-- config.dpapi を復号し endpoint / secret を取得
-- JSON payload を Base64 化
-- HMAC-SHA256 署名
-- GAS へ HTTPS POST
+Virgo Standard/Lite - poc_health_report.ps1
+
+目的:
+- PCの健康状態を収集
+- C:\OpsCheck\config.dpapi を DPAPI(LocalMachine) で復号
+- HMAC-SHA256 署名付きで GAS に送信
+- ログは C:\OpsCheck\poc_health_report.log
+- ログ内のデプロイURLは自動マスク
 #>
 
 Set-StrictMode -Version Latest
@@ -15,46 +17,150 @@ $ErrorActionPreference = 'Stop'
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$TargetDir     = 'C:\OpsCheck'
-$ConfigPath    = Join-Path $TargetDir 'config.dpapi'
-$ScriptVersion = '4.9.1'
+$BaseDir    = 'C:\OpsCheck'
+$ConfigPath = Join-Path $BaseDir 'config.dpapi'
+$LogPath    = Join-Path $BaseDir 'poc_health_report.log'
 
-function Write-Info([string]$Message) {
-    Write-Host "[INFO] $Message" -ForegroundColor Cyan
+function Get-NowText {
+    return (Get-Date).ToString('yyyy/MM/dd HH:mm:ss')
 }
 
-function Throw-HealthError([string]$Message) {
-    throw $Message
+function Mask-DeployUrlInText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $Text
+    }
+
+    return ($Text -replace 'https://script\.google\.com/macros/s/[^/\s"]+/exec', 'https://script.google.com/macros/s/***masked***/exec')
 }
 
-function Start-Jitter {
-    $seconds = Get-Random -Minimum 1 -Maximum 300
-    Start-Sleep -Seconds $seconds
+function Mask-SensitiveText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $Text
+    }
+
+    $masked = $Text
+    $masked = $masked -replace '"secret"\s*:\s*"[^"]+"', '"secret":"***masked***"'
+    $masked = $masked -replace '"signature"\s*:\s*"[^"]+"', '"signature":"***masked***"'
+    $masked = $masked -replace '"payloadBase64"\s*:\s*"[^"]+"', '"payloadBase64":"***masked***"'
+    $masked = Mask-DeployUrlInText -Text $masked
+    return $masked
+}
+
+function Initialize-Log {
+    try {
+        $header = @(
+            ''
+            '============================================================'
+            "$(Get-NowText) [INFO ] poc_health_report.ps1 実行開始"
+            "BaseDir: $BaseDir"
+            '============================================================'
+        )
+        Add-Content -LiteralPath $LogPath -Value $header -Encoding UTF8
+    } catch {}
+}
+
+function Write-LogLine {
+    param(
+        [Parameter(Mandatory = $true)][string]$Level,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+
+    $safeMessage = Mask-SensitiveText -Text $Message
+    $line = "{0} [{1}] {2}" -f (Get-NowText), $Level.ToUpper().PadRight(5), $safeMessage
+    try {
+        Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+    } catch {}
+}
+
+function Write-Info {
+    param([string]$Message)
+    Write-LogLine -Level 'INFO' -Message $Message
+}
+
+function Write-Ok {
+    param([string]$Message)
+    Write-LogLine -Level 'OK' -Message $Message
+}
+
+function Write-Warn {
+    param([string]$Message)
+    Write-LogLine -Level 'WARN' -Message $Message
+}
+
+function Write-Err {
+    param([string]$Message)
+    Write-LogLine -Level 'ERROR' -Message $Message
 }
 
 function Get-DeviceUuid {
     try {
         $uuid = (Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction Stop).UUID
-        if (-not [string]::IsNullOrWhiteSpace($uuid)) { return $uuid.Trim() }
-    } catch {}
+        if (-not [string]::IsNullOrWhiteSpace($uuid)) {
+            return $uuid.Trim()
+        }
+    } catch {
+        Write-Warn "Get-CimInstance UUID failed: $($_.Exception.Message)"
+    }
 
     try {
         $uuid = (Get-WmiObject Win32_ComputerSystemProduct -ErrorAction Stop).UUID
-        if (-not [string]::IsNullOrWhiteSpace($uuid)) { return $uuid.Trim() }
-    } catch {}
+        if (-not [string]::IsNullOrWhiteSpace($uuid)) {
+            return $uuid.Trim()
+        }
+    } catch {
+        Write-Warn "Get-WmiObject UUID failed: $($_.Exception.Message)"
+    }
 
-    Throw-HealthError 'UUID の取得に失敗しました。'
+    throw 'UUID の取得に失敗しました。'
 }
 
-function Get-LoggedOnUser {
-    try {
-        $userName = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
-        if (-not [string]::IsNullOrWhiteSpace($userName)) {
-            if ($userName -match '\\') { return $userName.Split('\')[-1] }
-            return $userName
-        }
-    } catch {}
-    return $env:USERNAME
+function Load-VirgoConfig {
+    if (-not (Test-Path -LiteralPath $ConfigPath)) {
+        throw "config.dpapi が見つかりません: $ConfigPath"
+    }
+
+    Add-Type -AssemblyName System.Security
+    $encBytes = [System.IO.File]::ReadAllBytes($ConfigPath)
+
+    $plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+        $encBytes,
+        $null,
+        [System.Security.Cryptography.DataProtectionScope]::LocalMachine
+    )
+
+    $json = [System.Text.Encoding]::UTF8.GetString($plainBytes)
+    Write-LogLine -Level 'DEBUG' -Message "config loaded"
+
+    $obj = $json | ConvertFrom-Json -ErrorAction Stop
+    if (-not $obj.endpoint) { throw 'config.dpapi に endpoint がありません。' }
+    if (-not $obj.secret)   { throw 'config.dpapi に secret がありません。' }
+
+    return $obj
+}
+
+function Get-EffectiveEndpoint {
+    param([Parameter(Mandatory = $true)]$Config)
+
+    $envEndpoint = [Environment]::GetEnvironmentVariable('VIRGO_ENDPOINT', 'Machine')
+    if (-not [string]::IsNullOrWhiteSpace($envEndpoint)) {
+        Write-Info 'Machine環境変数 VIRGO_ENDPOINT を使用します。'
+        return $envEndpoint.Trim()
+    }
+
+    Write-Warn 'Machine環境変数 VIRGO_ENDPOINT が空のため、config.dpapi の endpoint を使用します。'
+    return ([string]$Config.endpoint).Trim()
+}
+
+function Get-CustomerGroup {
+    $group = [Environment]::GetEnvironmentVariable('VIRGO_CUSTOMER_GROUP', 'Machine')
+    if (-not [string]::IsNullOrWhiteSpace($group)) {
+        return $group.Trim()
+    }
+    return $env:COMPUTERNAME
 }
 
 function Get-WindowsRelease {
@@ -62,516 +168,382 @@ function Get-WindowsRelease {
         $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
         if ($cv.DisplayVersion) { return [string]$cv.DisplayVersion }
         if ($cv.ReleaseId)      { return [string]$cv.ReleaseId }
-        return "$($cv.CurrentBuild).$($cv.UBR)"
+        return [string]$cv.CurrentBuild
     } catch {
-        return '不明'
-    }
-}
-
-function Read-ProtectedConfig {
-    if (-not (Test-Path -LiteralPath $ConfigPath)) {
-        Throw-HealthError "config.dpapi が見つかりません: $ConfigPath"
-    }
-
-    Add-Type -AssemblyName System.Security
-
-    try {
-        $encryptedBytes = [System.IO.File]::ReadAllBytes($ConfigPath)
-        $plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
-            $encryptedBytes,
-            $null,
-            [System.Security.Cryptography.DataProtectionScope]::LocalMachine
-        )
-        $plainText = [System.Text.Encoding]::UTF8.GetString($plainBytes)
-        if ([string]::IsNullOrWhiteSpace($plainText)) {
-            Throw-HealthError 'config.dpapi の復号結果が空です。'
-        }
-
-        try {
-            $config = $plainText | ConvertFrom-Json -ErrorAction Stop
-            $endpoint = [string]$config.endpoint
-            $secret   = [string]$config.secret
-        }
-        catch {
-            $endpoint = [Environment]::GetEnvironmentVariable('VIRGO_ENDPOINT', 'Machine')
-            $secret   = $plainText
-        }
-
-        if ([string]::IsNullOrWhiteSpace($endpoint)) {
-            $endpoint = [Environment]::GetEnvironmentVariable('VIRGO_ENDPOINT', 'Machine')
-        }
-        if ([string]::IsNullOrWhiteSpace($endpoint)) { Throw-HealthError 'endpoint が取得できません。' }
-        if ([string]::IsNullOrWhiteSpace($secret))   { Throw-HealthError 'secret が取得できません。' }
-
-        [PSCustomObject]@{
-            Endpoint = $endpoint
-            Secret   = $secret
-        }
-    }
-    catch {
-        Throw-HealthError "config.dpapi の復号に失敗しました。$($_.Exception.Message)"
-    }
-}
-
-function Get-SecurityDetails {
-    $result = [ordered]@{
-        Vendor        = '未検出'
-        Products      = ''
-        ProductDetected = $false
-        RtpEnabled    = $false
-        SigUpToDate   = $false
-        LastScanTime  = '不明'
-        RecentThreats = '不明'
-        EsetInstalled = $false
-        EsetScanStale = $false
-    }
-
-    try {
-        $wmiAv = Get-CimInstance -Namespace 'root\SecurityCenter2' -ClassName AntivirusProduct -ErrorAction Stop
-    } catch {
-        $wmiAv = @()
-    }
-
-    if ($null -eq $wmiAv) { $wmiAv = @() }
-    $thirdParty = @($wmiAv | Where-Object { $_.displayName -and $_.displayName -notmatch 'Defender' })
-
-    if ($thirdParty.Count -gt 0) {
-        $displayNames = @($thirdParty | ForEach-Object { [string]$_.displayName } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        $result.Products = ($displayNames -join ' / ')
-        $result.Vendor = $result.Products
-        $result.ProductDetected = $true
-        $result.RtpEnabled = $true
-        $result.SigUpToDate = $true
-        $result.RecentThreats = '特になし (サードパーティAV監視)'
-        $result.LastScanTime = '自動監視中'
-
-        $esetProduct = $thirdParty | Where-Object { $_.displayName -match 'ESET' } | Select-Object -First 1
-        if ($null -ne $esetProduct) {
-            $result.EsetInstalled = $true
-            $result.Vendor = [string]$esetProduct.displayName
-            try {
-                $esetService = Get-Service -Name 'ekrn' -ErrorAction Stop
-                if ($esetService.Status -eq 'Running') {
-                    $result.RtpEnabled = $true
-                    $result.SigUpToDate = $true
-                    $result.RecentThreats = '特になし (ESETにて保護中)'
-                    $result.LastScanTime = '自動監視中'
-                    $result.EsetScanStale = $false
-                } else {
-                    $result.RtpEnabled = $false
-                    $result.SigUpToDate = $false
-                    $result.RecentThreats = 'ESETサービス停止の可能性'
-                    $result.LastScanTime = '不明'
-                    $result.EsetScanStale = $true
-                }
-            } catch {
-                $result.RtpEnabled = $true
-                $result.SigUpToDate = $true
-                $result.RecentThreats = '特になし (ESET WMI検出)'
-                $result.LastScanTime = '自動監視中'
-                $result.EsetScanStale = $false
-            }
-        }
-
-        return [PSCustomObject]$result
-    }
-
-    $defenderPresent = @($wmiAv | Where-Object { $_.displayName -match 'Defender' }).Count -gt 0
-    if ($defenderPresent) {
-        try {
-            $mp = Get-MpComputerStatus -ErrorAction Stop
-            $result.Vendor = 'Microsoft Defender'
-            $result.Products = 'Microsoft Defender'
-            $result.ProductDetected = $true
-            $result.RtpEnabled = [bool]$mp.RealTimeProtectionEnabled
-
-            $sigDate = $mp.AntivirusSignatureLastUpdated
-            if ($sigDate -and ((Get-Date) - $sigDate).TotalDays -lt 3) {
-                $result.SigUpToDate = $true
-            }
-
-            $scanDate = $null
-            if ($mp.QuickScanStartTime -and $mp.QuickScanStartTime.Year -gt 2000) {
-                $scanDate = $mp.QuickScanStartTime
-            }
-            if ($mp.FullScanStartTime -and $mp.FullScanStartTime.Year -gt 2000) {
-                if ($null -eq $scanDate -or $mp.FullScanStartTime -gt $scanDate) {
-                    $scanDate = $mp.FullScanStartTime
-                }
-            }
-            if ($scanDate) {
-                $result.LastScanTime = $scanDate.ToString('yyyy/MM/dd HH:mm')
-            }
-
-            try {
-                $threat = Get-MpThreatDetection -ErrorAction Stop |
-                    Sort-Object InitialDetectionTime -Descending |
-                    Select-Object -First 1
-                if ($threat) {
-                    $result.RecentThreats = "検知あり: $($threat.ThreatName)"
-                } else {
-                    $result.RecentThreats = '特になし'
-                }
-            } catch {
-                $result.RecentThreats = '特になし'
-            }
-        }
-        catch {
-            $result.Vendor = 'Microsoft Defender'
-            $result.Products = 'Microsoft Defender'
-            $result.ProductDetected = $true
-            $result.RtpEnabled = $false
-            $result.SigUpToDate = $false
-            $result.RecentThreats = 'Defender状態取得失敗'
-        }
-    }
-
-    [PSCustomObject]$result
-}
-
-function Get-SmartCtlPath {
-    $candidates = @(
-        (Join-Path $TargetDir 'smartmontools\bin\smartctl.exe'),
-        "${env:ProgramFiles}\smartmontools\bin\smartctl.exe",
-        "${env:ProgramFiles(x86)}\smartmontools\bin\smartctl.exe"
-    )
-
-    foreach ($path in $candidates) {
-        if (Test-Path -LiteralPath $path) { return $path }
-    }
-
-    try {
-        $cmd = Get-Command 'smartctl' -ErrorAction Stop
-        return $cmd.Source
-    } catch {
+        Write-Warn "Windows version read failed: $($_.Exception.Message)"
         return ''
     }
 }
 
-function Get-DiskHealth {
-    $diskHealth = New-Object System.Collections.Generic.List[object]
-    $alerts = New-Object System.Collections.Generic.List[string]
-    $smartCtlPath = Get-SmartCtlPath
+function Convert-FromSecurityCenterProductState {
+    param([int]$ProductState)
+
+    # 大まかな判定で十分
+    if ($ProductState -eq 0) { return $false }
+    return $true
+}
+
+function Get-AntivirusInfo {
+    $result = [ordered]@{
+        AntivirusVendor         = ''
+        AntivirusProducts       = ''
+        AntivirusDetected       = $false
+        AntivirusLatestEvidence = ''
+        AntivirusEvidenceStale  = $false
+        ESETInstalled           = $false
+        ESETLatestScan          = ''
+        ESETScanStale           = $false
+    }
+
+    $displayNames = @()
 
     try {
-        $physicalDisks = @(Get-WmiObject Win32_DiskDrive -ErrorAction Stop)
-    } catch {
-        $physicalDisks = @()
-    }
-
-    if ($smartCtlPath) {
-        foreach ($pd in $physicalDisks) {
-            $diskInfo = [ordered]@{
-                Model        = [string]$pd.Model
-                Status       = '不明'
-                Temperature  = '不明'
-                PowerOnHours = '不明'
-            }
-
-            $pdNum = [string]$pd.DeviceID -replace '\D', ''
-            $smartDevice = "/dev/pd$pdNum"
-
-            try {
-                $smartOutput = & $smartCtlPath -a $smartDevice 2>$null
-            } catch {
-                $smartOutput = $null
-            }
-
-            if ($smartOutput) {
-                foreach ($line in $smartOutput) {
-                    $trim = [string]$line
-                    if ($trim -match 'SMART overall-health self-assessment test result:\s*(.*)') {
-                        $diskInfo.Status = $matches[1].Trim()
-                    } elseif ($trim -match 'SMART Health Status:\s*(.*)') {
-                        $diskInfo.Status = $matches[1].Trim()
-                    } elseif ($trim -match '^Temperature:\s+(\d+)\s+Celsius') {
-                        $diskInfo.Temperature = $matches[1]
-                    } elseif ($trim -match '^Power On Hours:\s+([\d,]+)') {
-                        $diskInfo.PowerOnHours = $matches[1].Replace(',', '')
-                    } else {
-                        $parts = $trim -split '\s+'
-                        if ($parts.Count -ge 10) {
-                            if ($parts[0] -eq '194' -and $parts[1] -match 'Temperature') {
-                                $diskInfo.Temperature = $parts[9]
-                            } elseif ($parts[0] -eq '9' -and $parts[1] -match 'Power_On_Hours') {
-                                $diskInfo.PowerOnHours = $parts[9]
-                            }
-                        }
-                    }
+        $products = Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop
+        if ($products) {
+            foreach ($p in $products) {
+                $name = [string]$p.displayName
+                if (-not [string]::IsNullOrWhiteSpace($name)) {
+                    $displayNames += $name.Trim()
+                }
+                if ($name -match 'ESET') {
+                    $result.ESETInstalled = $true
+                }
+                if (Convert-FromSecurityCenterProductState -ProductState ([int]$p.productState)) {
+                    $result.AntivirusDetected = $true
                 }
             }
-
-            if ($diskInfo.Status -notin @('PASSED', 'OK', 'Healthy', '正常', '不明')) {
-                $alerts.Add("[$($diskInfo.Model)] S.M.A.R.T.異常")
-            }
-
-            $diskHealth.Add([PSCustomObject]$diskInfo)
         }
+    } catch {
+        Write-Warn "SecurityCenter2 AntiVirusProduct read failed: $($_.Exception.Message)"
     }
-    else {
+
+    if ($displayNames.Count -gt 0) {
+        $result.AntivirusProducts = ($displayNames -join ', ')
+        $result.AntivirusVendor = $displayNames[0]
+        $result.AntivirusLatestEvidence = (Get-Date).ToString('yyyy/MM/dd HH:mm:ss')
+        $result.AntivirusEvidenceStale = $false
+    } else {
         try {
-            $fallbackDisks = @(Get-PhysicalDisk -ErrorAction Stop)
-            foreach ($d in $fallbackDisks) {
-                $statusText = if ($d.HealthStatus) { [string]$d.HealthStatus } else { '不明' }
-                if ($statusText -notin @('Healthy', '正常', 'OK', '不明')) {
-                    $alerts.Add("[$($d.FriendlyName)] S.M.A.R.T.要確認")
-                }
+            $def = Get-MpComputerStatus -ErrorAction Stop
+            $result.AntivirusProducts = 'Microsoft Defender'
+            $result.AntivirusVendor = 'Microsoft Defender'
+            $result.AntivirusDetected = [bool]$def.AntivirusEnabled
+            if ($def.AntivirusSignatureLastUpdated) {
+                $result.AntivirusLatestEvidence = ([datetime]$def.AntivirusSignatureLastUpdated).ToString('yyyy/MM/dd HH:mm:ss')
+                $age = (New-TimeSpan -Start ([datetime]$def.AntivirusSignatureLastUpdated) -End (Get-Date)).TotalDays
+                $result.AntivirusEvidenceStale = ($age -gt 14)
+            }
+        } catch {
+            Write-Warn "Defender status read failed: $($_.Exception.Message)"
+        }
+    }
 
-                $diskHealth.Add([PSCustomObject]@{
-                    Model        = [string]$d.FriendlyName
-                    Status       = $statusText
-                    Temperature  = '不明'
-                    PowerOnHours = '不明'
-                })
+    return [PSCustomObject]$result
+}
+
+function Get-VolumeInfo {
+    $volumes = @()
+    try {
+        $items = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" -ErrorAction Stop
+        foreach ($v in $items) {
+            $size = [double]($v.Size)
+            $free = [double]($v.FreeSpace)
+            $usedPct = if ($size -gt 0) { [math]::Round((($size - $free) / $size) * 100, 1) } else { 0 }
+            $freeGb = if ($free -gt 0) { [math]::Round($free / 1GB, 1) } else { 0 }
+
+            $volumes += [ordered]@{
+                driveLetter = [string]$v.DeviceID
+                volumeName  = [string]$v.VolumeName
+                freeGb      = $freeGb
+                usedPct     = $usedPct
             }
         }
-        catch {
-            $alerts.Add('smartmontools未検出')
-        }
-    }
-
-    [PSCustomObject]@{
-        Items  = @($diskHealth)
-        Alerts = @($alerts)
-    }
-}
-
-function Get-LogicalDisks {
-    try {
-        @(Get-WmiObject Win32_LogicalDisk -Filter "DriveType=2 OR DriveType=3" -ErrorAction Stop)
     } catch {
-        @()
+        Write-Warn "Volume info read failed: $($_.Exception.Message)"
     }
+    return $volumes
 }
 
-function Get-LatestBackupFile {
+function Get-DiskHealthInfo {
+    $disks = @()
+
+    try {
+        $physicalDisks = Get-PhysicalDisk -ErrorAction Stop
+        foreach ($d in $physicalDisks) {
+            $health = [string]$d.HealthStatus
+            $disks += [ordered]@{
+                model        = [string]$d.FriendlyName
+                mediaType    = [string]$d.MediaType
+                healthStatus = $health
+                operationalStatus = ([string]($d.OperationalStatus -join ', '))
+            }
+        }
+    } catch {
+        Write-Warn "Get-PhysicalDisk failed: $($_.Exception.Message)"
+    }
+
+    $smartctl = Join-Path $BaseDir 'smartmontools\bin\smartctl.exe'
+    if (Test-Path -LiteralPath $smartctl) {
+        Write-Info "smartctl found: $smartctl"
+    } else {
+        Write-Warn "smartctl not found: $smartctl"
+    }
+
+    return $disks
+}
+
+function Get-RecentFileDate {
     param(
-        [Parameter(Mandatory = $true)][array]$LogicalDisks,
+        [Parameter(Mandatory = $true)][string[]]$RootPaths,
         [Parameter(Mandatory = $true)][string[]]$Patterns
     )
 
-    $best = $null
-    foreach ($disk in $LogicalDisks) {
-        $root = [string]$disk.DeviceID
-        if (-not $root) { continue }
+    $latest = $null
+
+    foreach ($root in $RootPaths) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+
         foreach ($pattern in $Patterns) {
             try {
-                $found = Get-ChildItem -Path "$root\" -Filter $pattern -Recurse -File -ErrorAction SilentlyContinue |
-                    Sort-Object LastWriteTime -Descending |
-                    Select-Object -First 1
-                if ($found -and ($null -eq $best -or $found.LastWriteTime -gt $best.LastWriteTime)) {
-                    $best = $found
+                $files = Get-ChildItem -Path $root -Filter $pattern -File -Recurse -ErrorAction SilentlyContinue
+                foreach ($f in $files) {
+                    if ($null -eq $latest -or $f.LastWriteTime -gt $latest) {
+                        $latest = $f.LastWriteTime
+                    }
                 }
             } catch {}
         }
     }
-    return $best
+
+    return $latest
 }
 
-function Get-BackupFreshness {
-    param([array]$LogicalDisks)
-
-    $macriumFile = Get-LatestBackupFile -LogicalDisks $LogicalDisks -Patterns @('*.mrimg')
-    $hasleoFile  = Get-LatestBackupFile -LogicalDisks $LogicalDisks -Patterns @('*.pbd')
-
-    $macInstalled = $null -ne $macriumFile
-    $macLast = if ($macInstalled) { $macriumFile.LastWriteTime.ToString('yyyy/MM/dd HH:mm') } else { '' }
-    $macStale = if ($macInstalled) { ((Get-Date) - $macriumFile.LastWriteTime).TotalDays -gt 14 } else { $false }
-
-    $hasInstalled = $null -ne $hasleoFile
-    $hasLast = if ($hasInstalled) { $hasleoFile.LastWriteTime.ToString('yyyy/MM/dd HH:mm') } else { '' }
-    $hasStale = if ($hasInstalled) { ((Get-Date) - $hasleoFile.LastWriteTime).TotalDays -gt 14 } else { $false }
-
-    [PSCustomObject]@{
-        MacriumInstalled  = $macInstalled
-        MacriumLatestLog  = $macLast
-        ReflectImageStale = $macStale
-        HasleoInstalled   = $hasInstalled
-        HasleoLatestImage = $hasLast
-        HasleoImageStale  = $hasStale
+function Get-BackupInfo {
+    $result = [ordered]@{
+        MacriumInstalled   = $false
+        MacriumLatestLog   = ''
+        ReflectImageStale  = $false
+        HasleoInstalled    = $false
+        HasleoLatestImage  = ''
+        HasleoImageStale   = $false
     }
-}
 
-function Get-TargetVolumes {
-    param(
-        [array]$LogicalDisks,
-        [array]$DiskHealthItems
+    $macriumRoots = @(
+        'C:\ProgramData\Macrium',
+        'C:\Reflect',
+        'C:\Backup',
+        'D:\',
+        'E:\'
     )
 
-    $volumes = New-Object System.Collections.Generic.List[object]
-    $globalSmart = if (@($DiskHealthItems | Where-Object { $_.Status -notin @('PASSED', 'OK', 'Healthy', '正常', '不明') }).Count -gt 0) { '要注意' } else { '正常' }
+    $hasleoRoots = @(
+        'C:\Program Files\Hasleo',
+        'C:\ProgramData\Hasleo',
+        'C:\Backup',
+        'D:\',
+        'E:\'
+    )
 
-    foreach ($d in $LogicalDisks) {
-        if (-not $d.Size -or [double]$d.Size -le 0) { continue }
-
-        $driveLetter = [string]$d.DeviceID
-        $sizeGb = [math]::Round(([double]$d.Size / 1GB), 1)
-        $freeGb = [math]::Round(([double]$d.FreeSpace / 1GB), 1)
-        $usedGb = [math]::Round(($sizeGb - $freeGb), 1)
-
-        $isBackup = $false
-        try {
-            $hasMacrium = Get-ChildItem -Path "$driveLetter\" -Filter '*.mrimg' -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-            $hasHasleo  = Get-ChildItem -Path "$driveLetter\" -Filter '*.pbd'   -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-            $isBackup = ($null -ne $hasMacrium) -or ($null -ne $hasHasleo)
-        } catch {}
-
-        $isTarget = ($driveLetter -eq 'C:') -or $isBackup
-        if (-not $isTarget) { continue }
-
-        $volumes.Add([PSCustomObject]@{
-            Drive       = $driveLetter.Replace(':', '')
-            SizeGB      = $sizeGb
-            UsedGB      = $usedGb
-            FreeGB      = $freeGb
-            IsBackup    = $isBackup
-            IsTarget    = $true
-            SmartHealth = $globalSmart
-        })
+    if (Test-Path 'C:\Program Files\Macrium') {
+        $result.MacriumInstalled = $true
     }
 
-    @($volumes)
+    if (Test-Path 'C:\Program Files\Hasleo') {
+        $result.HasleoInstalled = $true
+    }
+
+    $latestMacrium = Get-RecentFileDate -RootPaths $macriumRoots -Patterns @('*.mrimg', '*.html', '*.log')
+    if ($latestMacrium) {
+        $result.MacriumLatestLog = ([datetime]$latestMacrium).ToString('yyyy/MM/dd HH:mm:ss')
+        $result.ReflectImageStale = ((New-TimeSpan -Start ([datetime]$latestMacrium) -End (Get-Date)).TotalDays -gt 14)
+    }
+
+    $latestHasleo = Get-RecentFileDate -RootPaths $hasleoRoots -Patterns @('*.hbi', '*.adi', '*.log')
+    if ($latestHasleo) {
+        $result.HasleoLatestImage = ([datetime]$latestHasleo).ToString('yyyy/MM/dd HH:mm:ss')
+        $result.HasleoImageStale = ((New-TimeSpan -Start ([datetime]$latestHasleo) -End (Get-Date)).TotalDays -gt 14)
+    }
+
+    return [PSCustomObject]$result
 }
 
-function Compute-Signature {
+function Get-HealthStatusAndAlerts {
+    param(
+        [Parameter(Mandatory = $true)]$Volumes,
+        [Parameter(Mandatory = $true)]$DiskHealth,
+        [Parameter(Mandatory = $true)]$Antivirus,
+        [Parameter(Mandatory = $true)]$Backup
+    )
+
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $healthStatus = 'OK'
+
+    foreach ($v in $Volumes) {
+        if ($v.driveLetter -eq 'C:' -and [double]$v.freeGb -lt 20) {
+            $alerts.Add("C drive free space low: $($v.freeGb)GB")
+        }
+    }
+
+    foreach ($d in $DiskHealth) {
+        if (($d.healthStatus -ne 'Healthy') -and ($d.healthStatus -ne '正常') -and (-not [string]::IsNullOrWhiteSpace($d.healthStatus))) {
+            $alerts.Add("Disk health warning: $($d.model) / $($d.healthStatus)")
+        }
+    }
+
+    if (-not [bool]$Antivirus.AntivirusDetected) {
+        $alerts.Add('Antivirus not detected')
+    }
+
+    if ([bool]$Backup.ReflectImageStale) {
+        $alerts.Add('Reflect backup stale')
+    }
+
+    if ([bool]$Backup.HasleoImageStale) {
+        $alerts.Add('Hasleo backup stale')
+    }
+
+    if ($alerts.Count -gt 0) {
+        $healthStatus = 'WARN'
+    }
+
+    return [PSCustomObject]@{
+        HealthStatus = $healthStatus
+        Alerts       = @($alerts.ToArray())
+    }
+}
+
+function ConvertTo-Base64Json {
+    param([Parameter(Mandatory = $true)]$Object)
+
+    $json = $Object | ConvertTo-Json -Compress -Depth 12
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+    return [Convert]::ToBase64String($bytes)
+}
+
+function New-HmacSignature {
     param(
         [Parameter(Mandatory = $true)][string]$Secret,
         [Parameter(Mandatory = $true)][string]$Uuid,
-        [Parameter(Mandatory = $true)][string]$UnixTimestamp,
+        [Parameter(Mandatory = $true)][long]$Timestamp,
         [Parameter(Mandatory = $true)][string]$Nonce,
         [Parameter(Mandatory = $true)][string]$PayloadBase64
     )
 
-    $signData = "$Uuid|$UnixTimestamp|$Nonce|$PayloadBase64"
+    $signData = "$Uuid|$Timestamp|$Nonce|$PayloadBase64"
     $hmac = New-Object System.Security.Cryptography.HMACSHA256
     try {
         $hmac.Key = [System.Text.Encoding]::UTF8.GetBytes($Secret)
-        $hashBytes = $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($signData))
-        [Convert]::ToBase64String($hashBytes)
+        $hash = $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($signData))
+        return [Convert]::ToBase64String($hash)
     }
     finally {
         $hmac.Dispose()
     }
 }
 
-try {
-    Start-Jitter
+function Invoke-SignedPost {
+    param(
+        [Parameter(Mandatory = $true)][string]$Endpoint,
+        [Parameter(Mandatory = $true)][string]$Secret,
+        [Parameter(Mandatory = $true)][string]$Uuid,
+        [Parameter(Mandatory = $true)]$InnerPayload
+    )
 
-    $customerGroup = [Environment]::GetEnvironmentVariable('VIRGO_CUSTOMER_GROUP', 'Machine')
-    if ([string]::IsNullOrWhiteSpace($customerGroup)) {
-        Throw-HealthError 'VIRGO_CUSTOMER_GROUP が未設定です。'
-    }
+    $timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $nonce = ([Guid]::NewGuid().ToString('N'))
+    $payloadBase64 = ConvertTo-Base64Json -Object $InnerPayload
+    $signature = New-HmacSignature -Secret $Secret -Uuid $Uuid -Timestamp $timestamp -Nonce $nonce -PayloadBase64 $payloadBase64
 
-    $config = Read-ProtectedConfig
-    $endpoint = [string]$config.Endpoint
-    $deviceSecret = [string]$config.Secret
-
-    $uuid           = Get-DeviceUuid
-    $hostName       = $env:COMPUTERNAME
-    $pcUser         = Get-LoggedOnUser
-    $timestampLocal = (Get-Date).ToString('yyyy/MM/dd HH:mm:ss')
-
-    $alerts = New-Object System.Collections.Generic.List[string]
-    $healthStatus = '正常'
-
-    $security = Get-SecurityDetails
-    if (-not $security.ProductDetected) {
-        $alerts.Add('セキュリティ: AV製品が検出されません')
-    }
-    if ($security.ProductDetected -and -not $security.RtpEnabled) {
-        $alerts.Add('セキュリティ: 保護機能が無効です')
-    }
-    if ($security.ProductDetected -and -not $security.SigUpToDate) {
-        $alerts.Add('セキュリティ: 定義ファイルが古い可能性があります')
-    }
-    if ($security.RecentThreats -match '^検知あり') {
-        $alerts.Add("セキュリティ: $($security.RecentThreats)")
-    }
-
-    $logicalDisks      = Get-LogicalDisks
-    $diskHealthResult  = Get-DiskHealth
-    foreach ($a in $diskHealthResult.Alerts) {
-        $alerts.Add([string]$a)
-    }
-
-    $backupInfo = Get-BackupFreshness -LogicalDisks $logicalDisks
-    if ($backupInfo.ReflectImageStale) {
-        $alerts.Add('バックアップ: (R) 14日以上更新されていません')
-    }
-    if ($backupInfo.HasleoImageStale) {
-        $alerts.Add('バックアップ: (H) 14日以上更新されていません')
-    }
-
-    $volumes = Get-TargetVolumes -LogicalDisks $logicalDisks -DiskHealthItems $diskHealthResult.Items
-    foreach ($v in $volumes) {
-        if ($v.SizeGB -gt 0 -and (($v.FreeGB / $v.SizeGB) -lt 0.1)) {
-            $alerts.Add("[$($v.Drive):] 容量不足")
-        }
-    }
-
-    if ($alerts.Count -gt 0) {
-        $healthStatus = '警告'
-    }
-
-    $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
-    $scriptHash = (Get-FileHash -Path $scriptPath -Algorithm SHA256).Hash
-
-    $innerPayload = [ordered]@{
-        customerGroup           = $customerGroup
-        device                  = $hostName
-        pcUser                  = $pcUser
-        uuid                    = $uuid
-        timestamp               = $timestampLocal
-        scriptVersion           = $ScriptVersion
-        scriptHash              = $scriptHash
-
-        antivirusVendor         = $security.Vendor
-        antivirusProducts       = $security.Products
-        antivirusDetected       = [bool]$security.ProductDetected
-        antivirusEvidenceStale  = [bool](-not $security.SigUpToDate)
-        antivirusLatestEvidence = $security.RecentThreats
-
-        esetInstalled           = [bool]$security.EsetInstalled
-        esetLatestScan          = $security.LastScanTime
-        esetScanStale           = [bool]$security.EsetScanStale
-
-        macriumInstalled        = [bool]$backupInfo.MacriumInstalled
-        macriumLatestLog        = $backupInfo.MacriumLatestLog
-        reflectImageStale       = [bool]$backupInfo.ReflectImageStale
-
-        hasleoInstalled         = [bool]$backupInfo.HasleoInstalled
-        hasleoLatestImage       = $backupInfo.HasleoLatestImage
-        hasleoImageStale        = [bool]$backupInfo.HasleoImageStale
-
-        volumes                 = @($volumes)
-        diskHealth              = @($diskHealthResult.Items)
-        windowsRelease          = Get-WindowsRelease
-        healthStatus            = $healthStatus
-        alerts                  = @($alerts)
-    }
-
-    $innerJson     = $innerPayload | ConvertTo-Json -Compress -Depth 8
-    $payloadBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($innerJson))
-
-    $unixTimestamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds().ToString()
-    $nonce         = [Guid]::NewGuid().ToString()
-    $signature     = Compute-Signature -Secret $deviceSecret -Uuid $uuid -UnixTimestamp $unixTimestamp -Nonce $nonce -PayloadBase64 $payloadBase64
-
-    $outerPayload = [ordered]@{
-        signature     = $signature
-        uuid          = $uuid
-        timestamp     = $unixTimestamp
+    $outerBody = @{
+        uuid          = $Uuid
+        timestamp     = $timestamp
         nonce         = $nonce
         payloadBase64 = $payloadBase64
+        signature     = $signature
     }
 
-    $outerJson = $outerPayload | ConvertTo-Json -Compress -Depth 6
+    $outerJson = $outerBody | ConvertTo-Json -Compress -Depth 10
     $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($outerJson)
 
-    Invoke-RestMethod -Uri $endpoint -Method Post -ContentType 'application/json; charset=utf-8' -Body $bodyBytes -ErrorAction Stop | Out-Null
-    exit 0
+    Write-LogLine -Level 'DEBUG' -Message "POST Endpoint: $Endpoint"
+    Write-LogLine -Level 'DEBUG' -Message "POST Body: $(Mask-SensitiveText -Text $outerJson)"
+
+    $response = Invoke-WebRequest -Uri $Endpoint -Method Post -ContentType 'application/json; charset=utf-8' -Body $bodyBytes -UseBasicParsing -ErrorAction Stop
+    $content = [string]$response.Content
+
+    Write-LogLine -Level 'DEBUG' -Message "Response Status: $($response.StatusCode)"
+    Write-LogLine -Level 'DEBUG' -Message "Response Body: $(Mask-SensitiveText -Text $content)"
+
+    return [PSCustomObject]@{
+        StatusCode = [int]$response.StatusCode
+        Content    = $content
+    }
+}
+
+Initialize-Log
+
+try {
+    Write-Info "config.dpapi を確認しています: $ConfigPath"
+    $config = Load-VirgoConfig
+    $endpoint = Get-EffectiveEndpoint -Config $config
+    $uuid = Get-DeviceUuid
+    $customerGroup = Get-CustomerGroup
+
+    Write-Ok 'config.dpapi の復号に成功しました。'
+    Write-Info "Endpoint resolved"
+    Write-Info "UUID: $uuid"
+    Write-Info "CustomerGroup: $customerGroup"
+
+    $antivirus = Get-AntivirusInfo
+    $volumes = Get-VolumeInfo
+    $diskHealth = Get-DiskHealthInfo
+    $backup = Get-BackupInfo
+    $health = Get-HealthStatusAndAlerts -Volumes $volumes -DiskHealth $diskHealth -Antivirus $antivirus -Backup $backup
+
+    $payload = [ordered]@{
+        timestamp                = (Get-Date).ToString('yyyy/MM/dd HH:mm:ss')
+        customerGroup            = $customerGroup
+        customerName             = $customerGroup
+        customerEmail            = ''
+        pcLocation               = ''
+        pcUser                   = $env:USERNAME
+        device                   = $env:COMPUTERNAME
+        scriptVersion            = 'virgo-health-v4-logmask-1.0'
+        antivirusVendor          = [string]$antivirus.AntivirusVendor
+        antivirusProducts        = [string]$antivirus.AntivirusProducts
+        antivirusDetected        = [bool]$antivirus.AntivirusDetected
+        antivirusLatestEvidence  = [string]$antivirus.AntivirusLatestEvidence
+        antivirusEvidenceStale   = [bool]$antivirus.AntivirusEvidenceStale
+        esetInstalled            = [bool]$antivirus.ESETInstalled
+        macriumInstalled         = [bool]$backup.MacriumInstalled
+        macriumLatestLog         = [string]$backup.MacriumLatestLog
+        hasleoInstalled          = [bool]$backup.HasleoInstalled
+        hasleoLatestImage        = [string]$backup.HasleoLatestImage
+        hasleoImageStale         = [bool]$backup.HasleoImageStale
+        volumes                  = @($volumes)
+        diskHealth               = @($diskHealth)
+        esetLatestScan           = [string]$antivirus.ESETLatestScan
+        esetScanStale            = [bool]$antivirus.ESETScanStale
+        windowsRelease           = (Get-WindowsRelease)
+        reflectImageStale        = [bool]$backup.ReflectImageStale
+        healthStatus             = [string]$health.HealthStatus
+        alerts                   = @($health.Alerts)
+        uuid                     = $uuid
+        scriptHash               = 'LOCAL_TEST_UNSET_HASH'
+    }
+
+    Write-LogLine -Level 'DEBUG' -Message ("Inner Payload: " + (($payload | ConvertTo-Json -Compress -Depth 12)))
+
+    $res = Invoke-SignedPost -Endpoint $endpoint -Secret ([string]$config.secret) -Uuid $uuid -InnerPayload $payload
+
+    if ($res.StatusCode -eq 200 -and $res.Content -match '^ok') {
+        Write-Ok '生データ送信は成功しました。'
+    } else {
+        Write-Warn "応答が想定外です: $($res.Content)"
+    }
 }
 catch {
-    Write-Host "[ERROR] $($_.Exception.Message)" -ForegroundColor Red
+    Write-Err $_.Exception.Message
+    Write-LogLine -Level 'ERROR' -Message ($_ | Out-String)
     exit 1
 }
