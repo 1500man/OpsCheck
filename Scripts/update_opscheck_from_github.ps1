@@ -1,14 +1,13 @@
 #requires -Version 5.1
-param(
-    [switch]$SkipPendingPromote
-)
-
 <#
-Virgo Standard V4 - update_opscheck_from_github.ps1
-- GitHub Release から最新版を取得
-- HTML誤保存をブロック
-- updater 自身は .pending へ退避し、安全に昇格
-- 更新ログを HMAC 署名付きで GAS へ送信
+Virgo Standard/Lite - update_opscheck_from_github.ps1
+
+目的:
+- GitHub Release(latest) から最新スクリプトを取得
+- poc_health_report.ps1 を安全に更新
+- update_opscheck_from_github.ps1 自身は .pending に保存して次回起動時に昇格
+- 更新結果を GAS に updateLog として送信
+- ログ内の URL は自動マスク
 #>
 
 Set-StrictMode -Version Latest
@@ -18,447 +17,431 @@ $ErrorActionPreference = 'Stop'
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$TargetDir = 'C:\OpsCheck'
-$ConfigPath = Join-Path $TargetDir 'config.dpapi'
-$ScriptVersion = '5.0.0'
+$BaseDir        = 'C:\OpsCheck'
+$ConfigPath     = Join-Path $BaseDir 'config.dpapi'
+$LogPath        = Join-Path $BaseDir 'update_opscheck.log'
+$HealthPath     = Join-Path $BaseDir 'poc_health_report.ps1'
+$UpdaterPath    = Join-Path $BaseDir 'update_opscheck_from_github.ps1'
+$PendingPath    = Join-Path $BaseDir 'update_opscheck_from_github.ps1.pending'
 
-$ReleaseOwner = if ($env:VIRGO_RELEASE_OWNER) { $env:VIRGO_RELEASE_OWNER } else { '1500man' }
-$ReleaseRepo  = if ($env:VIRGO_RELEASE_REPO)  { $env:VIRGO_RELEASE_REPO }  else { 'Virgo-Release' }
-$ReleaseBaseUrl = "https://github.com/$ReleaseOwner/$ReleaseRepo/releases/latest/download"
+# Release 配布URL
+$HealthReleaseUrl  = 'https://github.com/1500man/Virgo-Release/releases/latest/download/poc_health_report.ps1'
+$UpdaterReleaseUrl = 'https://github.com/1500man/Virgo-Release/releases/latest/download/update_opscheck_from_github.ps1'
 
-$FilesToDeploy = @(
-    'poc_health_report.ps1',
-    'update_opscheck_from_github.ps1'
-)
+$UpdaterVersion = 'virgo-updater-v6.0.0'
 
-function Write-Info([string]$Message) {
-    Write-Host "[INFO] $Message" -ForegroundColor Cyan
+function Get-NowText {
+    return (Get-Date).ToString('yyyy/MM/dd HH:mm:ss')
 }
 
-function Write-Warn([string]$Message) {
-    Write-Host "[WARN] $Message" -ForegroundColor Yellow
-}
+function Mask-UrlInText {
+    param([string]$Text)
 
-function Write-Ok([string]$Message) {
-    Write-Host "[ OK ] $Message" -ForegroundColor Green
-}
-
-function Throw-UpdateError([string]$Message) {
-    throw $Message
-}
-
-function Ensure-TargetDirectory {
-    if (-not (Test-Path -LiteralPath $TargetDir)) {
-        New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $Text
     }
+
+    $masked = $Text
+    $masked = $masked -replace 'https://script\.google\.com/macros/s/[^/\s"]+/exec', 'https://script.google.com/macros/s/***masked***/exec'
+    $masked = $masked -replace 'https://github\.com/[^/\s"]+/[^/\s"]+/releases/latest/download/[^"\s]+', 'https://github.com/***masked***/releases/latest/download/***masked***'
+    return $masked
 }
 
-function Get-CurrentScriptPath {
-    if ($PSCommandPath) { return $PSCommandPath }
-    return $MyInvocation.MyCommand.Path
+function Mask-SensitiveText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $Text
+    }
+
+    $masked = $Text
+    $masked = $masked -replace '"secret"\s*:\s*"[^"]+"', '"secret":"***masked***"'
+    $masked = $masked -replace '"signature"\s*:\s*"[^"]+"', '"signature":"***masked***"'
+    $masked = $masked -replace '"payloadBase64"\s*:\s*"[^"]+"', '"payloadBase64":"***masked***"'
+    $masked = Mask-UrlInText -Text $masked
+    return $masked
+}
+
+function Initialize-Log {
+    try {
+        $header = @(
+            ''
+            '============================================================'
+            "$(Get-NowText) [INFO ] update_opscheck_from_github.ps1 実行開始"
+            "BaseDir: $BaseDir"
+            "UpdaterVersion: $UpdaterVersion"
+            '============================================================'
+        )
+        Add-Content -LiteralPath $LogPath -Value $header -Encoding UTF8
+    } catch {}
+}
+
+function Write-LogLine {
+    param(
+        [Parameter(Mandatory = $true)][string]$Level,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+
+    $safeMessage = Mask-SensitiveText -Text $Message
+    $line = "{0} [{1}] {2}" -f (Get-NowText), $Level.ToUpper().PadRight(5), $safeMessage
+    try {
+        Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+    } catch {}
+}
+
+function Write-Info {
+    param([string]$Message)
+    Write-LogLine -Level 'INFO' -Message $Message
+}
+
+function Write-Ok {
+    param([string]$Message)
+    Write-LogLine -Level 'OK' -Message $Message
+}
+
+function Write-Warn {
+    param([string]$Message)
+    Write-LogLine -Level 'WARN' -Message $Message
+}
+
+function Write-Err {
+    param([string]$Message)
+    Write-LogLine -Level 'ERROR' -Message $Message
+}
+
+function Load-VirgoConfig {
+    if (-not (Test-Path -LiteralPath $ConfigPath)) {
+        throw "config.dpapi が見つかりません: $ConfigPath"
+    }
+
+    Add-Type -AssemblyName System.Security
+    $encBytes = [System.IO.File]::ReadAllBytes($ConfigPath)
+
+    $plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+        $encBytes,
+        $null,
+        [System.Security.Cryptography.DataProtectionScope]::LocalMachine
+    )
+
+    $json = [System.Text.Encoding]::UTF8.GetString($plainBytes)
+    Write-LogLine -Level 'DEBUG' -Message 'config loaded'
+
+    $obj = $json | ConvertFrom-Json -ErrorAction Stop
+    if (-not $obj.endpoint) { throw 'config.dpapi に endpoint がありません。' }
+    if (-not $obj.secret)   { throw 'config.dpapi に secret がありません。' }
+
+    return $obj
+}
+
+function Get-EffectiveEndpoint {
+    param([Parameter(Mandatory = $true)]$Config)
+
+    $envEndpoint = [Environment]::GetEnvironmentVariable('VIRGO_ENDPOINT', 'Machine')
+    if (-not [string]::IsNullOrWhiteSpace($envEndpoint)) {
+        Write-Info 'Machine環境変数 VIRGO_ENDPOINT を使用します。'
+        return $envEndpoint.Trim()
+    }
+
+    Write-Warn 'Machine環境変数 VIRGO_ENDPOINT が空のため、config.dpapi の endpoint を使用します。'
+    return ([string]$Config.endpoint).Trim()
+}
+
+function Get-CustomerGroup {
+    $group = [Environment]::GetEnvironmentVariable('VIRGO_CUSTOMER_GROUP', 'Machine')
+    if (-not [string]::IsNullOrWhiteSpace($group)) {
+        return $group.Trim()
+    }
+    return $env:COMPUTERNAME
 }
 
 function Get-DeviceUuid {
     try {
         $uuid = (Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction Stop).UUID
-        if (-not [string]::IsNullOrWhiteSpace($uuid)) { return $uuid.Trim() }
-    } catch {}
+        if (-not [string]::IsNullOrWhiteSpace($uuid)) {
+            return $uuid.Trim()
+        }
+    } catch {
+        Write-Warn "Get-CimInstance UUID failed: $($_.Exception.Message)"
+    }
 
     try {
         $uuid = (Get-WmiObject Win32_ComputerSystemProduct -ErrorAction Stop).UUID
-        if (-not [string]::IsNullOrWhiteSpace($uuid)) { return $uuid.Trim() }
-    } catch {}
-
-    Throw-UpdateError 'UUID の取得に失敗しました。'
-}
-
-function Read-ProtectedConfig {
-    if (-not (Test-Path -LiteralPath $ConfigPath)) {
-        Throw-UpdateError "config.dpapi が見つかりません: $ConfigPath"
+        if (-not [string]::IsNullOrWhiteSpace($uuid)) {
+            return $uuid.Trim()
+        }
+    } catch {
+        Write-Warn "Get-WmiObject UUID failed: $($_.Exception.Message)"
     }
 
-    Add-Type -AssemblyName System.Security
-
-    try {
-        $encryptedBytes = [System.IO.File]::ReadAllBytes($ConfigPath)
-        $plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
-            $encryptedBytes,
-            $null,
-            [System.Security.Cryptography.DataProtectionScope]::LocalMachine
-        )
-        $plainText = [System.Text.Encoding]::UTF8.GetString($plainBytes)
-        if ([string]::IsNullOrWhiteSpace($plainText)) {
-            Throw-UpdateError 'config.dpapi の復号結果が空です。'
-        }
-
-        try {
-            $config = $plainText | ConvertFrom-Json -ErrorAction Stop
-            $endpoint = [string]$config.endpoint
-            $secret   = [string]$config.secret
-        }
-        catch {
-            $endpoint = [Environment]::GetEnvironmentVariable('VIRGO_ENDPOINT', 'Machine')
-            $secret   = $plainText
-        }
-
-        if ([string]::IsNullOrWhiteSpace($endpoint)) {
-            $endpoint = [Environment]::GetEnvironmentVariable('VIRGO_ENDPOINT', 'Machine')
-        }
-        if ([string]::IsNullOrWhiteSpace($endpoint)) { Throw-UpdateError 'endpoint が取得できません。' }
-        if ([string]::IsNullOrWhiteSpace($secret))   { Throw-UpdateError 'secret が取得できません。' }
-
-        [PSCustomObject]@{
-            Endpoint = $endpoint
-            Secret   = $secret
-        }
-    }
-    catch {
-        Throw-UpdateError "config.dpapi の復号に失敗しました。$($_.Exception.Message)"
-    }
+    throw 'UUID の取得に失敗しました。'
 }
 
-function Get-WebErrorMessage {
-    param(
-        [Parameter(Mandatory = $true)][System.Exception]$Exception,
-        [string]$Url
-    )
-
-    try {
-        if ($Exception.Response -and $Exception.Response.StatusCode) {
-            $statusCode = [int]$Exception.Response.StatusCode
-            $statusText = [string]$Exception.Response.StatusDescription
-            switch ($statusCode) {
-                401 { return "HTTP 401 Unauthorized: $Url" }
-                403 { return "HTTP 403 Forbidden: $Url" }
-                404 { return "HTTP 404 Not Found: $Url" }
-                default { return "HTTP $statusCode $statusText: $Url" }
-            }
-        }
-    } catch {}
-
-    return $Exception.Message
-}
-
-function Test-DownloadedFileLooksValid {
+function Get-FileSha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path)) {
-        Throw-UpdateError "ダウンロードファイルが存在しません: $Path"
+        return ''
     }
 
-    $item = Get-Item -LiteralPath $Path -ErrorAction Stop
-    if ($item.Length -le 0) {
-        Throw-UpdateError "ダウンロードファイルが 0 バイトです: $Path"
-    }
-
-    $headLines = @()
     try {
-        $headLines = Get-Content -LiteralPath $Path -TotalCount 5 -Encoding UTF8 -ErrorAction Stop
+        return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
     } catch {
-        Throw-UpdateError "ダウンロードファイルの検査に失敗しました: $Path / $($_.Exception.Message)"
-    }
-
-    $joined = ($headLines -join "`n").TrimStart()
-    if ($joined -match '^(<!DOCTYPE|<html|<head|<body)') {
-        Throw-UpdateError "HTML が取得されました。Release asset ではなくエラーページの可能性があります: $Path"
+        Write-Warn "Hash取得失敗: $Path / $($_.Exception.Message)"
+        return ''
     }
 }
 
-function Promote-PendingAssets {
-    param([string]$CurrentScriptPath)
+function Test-DownloadedScriptIsHtml {
+    param([Parameter(Mandatory = $true)][string]$Path)
 
-    foreach ($file in $FilesToDeploy) {
-        $dest = Join-Path $TargetDir $file
-        $pending = "$dest.pending"
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $true
+    }
 
-        if (-not (Test-Path -LiteralPath $pending)) { continue }
-
-        if ($dest -ieq $CurrentScriptPath) {
-            continue
+    try {
+        $firstLines = Get-Content -LiteralPath $Path -TotalCount 5 -ErrorAction Stop
+        $joined = ($firstLines -join "`n")
+        if ($joined -match '<!DOCTYPE' -or $joined -match '<html' -or $joined -match '<HTML') {
+            return $true
         }
-
-        try {
-            $backup = "$dest.bak"
-            if (Test-Path -LiteralPath $dest) {
-                Copy-Item -LiteralPath $dest -Destination $backup -Force -ErrorAction Stop
-            }
-            Move-Item -LiteralPath $pending -Destination $dest -Force -ErrorAction Stop
-            Write-Ok "保留更新を適用しました: $file"
-        }
-        catch {
-            Write-Warn "保留更新の適用に失敗しました: $file / $($_.Exception.Message)"
-        }
+        return $false
+    } catch {
+        Write-Warn "HTML検査失敗: $Path / $($_.Exception.Message)"
+        return $true
     }
 }
 
-function Start-SelfPromotionHelper {
+function Download-ReleaseAsset {
     param(
-        [Parameter(Mandatory = $true)][string]$CurrentScriptPath,
-        [Parameter(Mandatory = $true)][string]$PendingPath
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$DestinationTemp
     )
 
-    $helperPath = Join-Path $TargetDir 'apply_pending_self_update.ps1'
-    $helperContent = @'
-param(
-    [Parameter(Mandatory = $true)][string]$CurrentScript,
-    [Parameter(Mandatory = $true)][string]$PendingScript,
-    [Parameter(Mandatory = $true)][int]$ParentPid
-)
+    Write-Info "ダウンロード開始: $Url"
 
-$deadline = (Get-Date).AddMinutes(2)
-while ((Get-Process -Id $ParentPid -ErrorAction SilentlyContinue) -and ((Get-Date) -lt $deadline)) {
-    Start-Sleep -Seconds 1
-}
+    Invoke-WebRequest -Uri $Url -OutFile $DestinationTemp -UseBasicParsing -ErrorAction Stop
 
-if (-not (Test-Path -LiteralPath $PendingScript)) {
-    exit 1
-}
-
-try {
-    $backup = "$CurrentScript.bak"
-    if (Test-Path -LiteralPath $CurrentScript) {
-        Copy-Item -LiteralPath $CurrentScript -Destination $backup -Force -ErrorAction Stop
+    if (-not (Test-Path -LiteralPath $DestinationTemp)) {
+        throw "ダウンロードファイルが存在しません: $DestinationTemp"
     }
 
-    Copy-Item -LiteralPath $PendingScript -Destination "$CurrentScript.new" -Force -ErrorAction Stop
-    Move-Item -LiteralPath "$CurrentScript.new" -Destination $CurrentScript -Force -ErrorAction Stop
-    Remove-Item -LiteralPath $PendingScript -Force -ErrorAction SilentlyContinue
+    if (Test-DownloadedScriptIsHtml -Path $DestinationTemp) {
+        Remove-Item -LiteralPath $DestinationTemp -Force -ErrorAction SilentlyContinue
+        throw "ダウンロード結果が HTML でした。Release asset URL または公開状態を確認してください。"
+    }
 
-    Start-Process -FilePath "powershell.exe" -ArgumentList @(
-        "-NoProfile",
-        "-ExecutionPolicy", "Bypass",
-        "-File", $CurrentScript,
-        "-SkipPendingPromote"
-    ) | Out-Null
-    exit 0
-}
-catch {
-    exit 1
-}
-'@
-
-    Set-Content -LiteralPath $helperPath -Value $helperContent -Encoding UTF8 -Force
-
-    Start-Process -FilePath "powershell.exe" -ArgumentList @(
-        '-NoProfile',
-        '-ExecutionPolicy', 'Bypass',
-        '-File', $helperPath,
-        '-CurrentScript', $CurrentScriptPath,
-        '-PendingScript', $PendingPath,
-        '-ParentPid', $PID
-    ) | Out-Null
+    Write-Ok "ダウンロード成功: $DestinationTemp"
 }
 
-function Maybe-Promote-SelfPending {
-    param([Parameter(Mandatory = $true)][string]$CurrentScriptPath)
+function Promote-PendingUpdaterIfExists {
+    if (-not (Test-Path -LiteralPath $PendingPath)) {
+        return
+    }
 
-    if ($SkipPendingPromote) { return }
+    Write-Info ".pending の昇格処理を開始します。"
 
-    $pendingPath = "$CurrentScriptPath.pending"
-    if (-not (Test-Path -LiteralPath $pendingPath)) { return }
+    if (Test-DownloadedScriptIsHtml -Path $PendingPath) {
+        Write-Warn ".pending が HTML だったため破棄します。"
+        Remove-Item -LiteralPath $PendingPath -Force -ErrorAction SilentlyContinue
+        return
+    }
 
-    Write-Info "自分自身の保留更新を検出しました。昇格処理を開始します。"
-    Start-SelfPromotionHelper -CurrentScriptPath $CurrentScriptPath -PendingPath $pendingPath
-    exit 0
+    try {
+        Copy-Item -LiteralPath $PendingPath -Destination $UpdaterPath -Force
+        Remove-Item -LiteralPath $PendingPath -Force -ErrorAction SilentlyContinue
+        Write-Ok 'updater 自身を .pending から昇格しました。'
+    } catch {
+        Write-Warn "updater 昇格に失敗しました: $($_.Exception.Message)"
+    }
 }
 
-function Compute-Signature {
+function New-Nonce {
+    return ([Guid]::NewGuid().ToString('N'))
+}
+
+function New-UnixTime {
+    return [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+}
+
+function ConvertTo-Base64Json {
+    param([Parameter(Mandatory = $true)]$Object)
+
+    $json = $Object | ConvertTo-Json -Compress -Depth 10
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+    return [Convert]::ToBase64String($bytes)
+}
+
+function New-HmacSignature {
     param(
         [Parameter(Mandatory = $true)][string]$Secret,
         [Parameter(Mandatory = $true)][string]$Uuid,
-        [Parameter(Mandatory = $true)][string]$UnixTimestamp,
+        [Parameter(Mandatory = $true)][long]$Timestamp,
         [Parameter(Mandatory = $true)][string]$Nonce,
         [Parameter(Mandatory = $true)][string]$PayloadBase64
     )
 
-    $signData = "$Uuid|$UnixTimestamp|$Nonce|$PayloadBase64"
+    $signData = "$Uuid|$Timestamp|$Nonce|$PayloadBase64"
     $hmac = New-Object System.Security.Cryptography.HMACSHA256
     try {
         $hmac.Key = [System.Text.Encoding]::UTF8.GetBytes($Secret)
-        $hashBytes = $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($signData))
-        [Convert]::ToBase64String($hashBytes)
+        $hash = $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($signData))
+        return [Convert]::ToBase64String($hash)
     }
     finally {
         $hmac.Dispose()
     }
 }
 
-function Send-UpdateLog {
+function Send-UpdateLogToGas {
     param(
         [Parameter(Mandatory = $true)][string]$Endpoint,
-        [Parameter(Mandatory = $true)][string]$DeviceSecret,
+        [Parameter(Mandatory = $true)][string]$Secret,
         [Parameter(Mandatory = $true)][string]$Uuid,
-        [Parameter(Mandatory = $true)][string]$CustomerGroup,
-        [Parameter(Mandatory = $true)][string]$Message,
-        [Parameter(Mandatory = $true)][int]$SuccessCount,
-        [Parameter(Mandatory = $true)][string]$SuccessFiles,
-        [Parameter(Mandatory = $true)][int]$FailedCount,
-        [Parameter(Mandatory = $true)][string]$FailedFiles,
-        [Parameter(Mandatory = $true)][string]$Errors
+        [Parameter(Mandatory = $true)][hashtable]$InnerPayload
     )
 
-    $innerPayload = [ordered]@{
-        action       = 'updateLog'
-        device       = $env:COMPUTERNAME
-        customerGroup= $CustomerGroup
-        uuid         = $Uuid
-        timestamp    = (Get-Date).ToString('yyyy/MM/dd HH:mm:ss')
-        updaterVer   = $ScriptVersion
-        message      = $Message
-        successCount = $SuccessCount
-        successFiles = $SuccessFiles
-        failedCount  = $FailedCount
-        failedFiles  = $FailedFiles
-        errors       = $Errors
-    }
+    $timestamp = New-UnixTime
+    $nonce = New-Nonce
+    $payloadBase64 = ConvertTo-Base64Json -Object $InnerPayload
+    $signature = New-HmacSignature -Secret $Secret -Uuid $Uuid -Timestamp $timestamp -Nonce $nonce -PayloadBase64 $payloadBase64
 
-    $innerJson     = $innerPayload | ConvertTo-Json -Compress -Depth 6
-    $payloadBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($innerJson))
-    $unixTimestamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds().ToString()
-    $nonce         = [Guid]::NewGuid().ToString()
-    $signature     = Compute-Signature -Secret $DeviceSecret -Uuid $Uuid -UnixTimestamp $unixTimestamp -Nonce $nonce -PayloadBase64 $payloadBase64
-
-    $outerPayload = [ordered]@{
-        signature     = $signature
+    $outerBody = @{
         uuid          = $Uuid
-        timestamp     = $unixTimestamp
+        timestamp     = $timestamp
         nonce         = $nonce
         payloadBase64 = $payloadBase64
+        signature     = $signature
     }
 
-    $outerJson = $outerPayload | ConvertTo-Json -Compress -Depth 6
+    $outerJson = $outerBody | ConvertTo-Json -Compress -Depth 10
     $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($outerJson)
 
-    try {
-        Invoke-RestMethod -Uri $Endpoint -Method Post -ContentType 'application/json; charset=utf-8' -Body $bodyBytes -ErrorAction Stop | Out-Null
-    }
-    catch {
-        Write-Warn "更新ログ送信に失敗しました: $($_.Exception.Message)"
-    }
-}
+    Write-LogLine -Level 'DEBUG' -Message "POST Endpoint: $Endpoint"
+    Write-LogLine -Level 'DEBUG' -Message "POST Body: $outerJson"
 
-function Download-And-StageAsset {
-    param(
-        [Parameter(Mandatory = $true)][string]$FileName,
-        [Parameter(Mandatory = $true)][string]$CurrentScriptPath
-    )
+    $response = Invoke-WebRequest -Uri $Endpoint -Method Post -ContentType 'application/json; charset=utf-8' -Body $bodyBytes -UseBasicParsing -ErrorAction Stop
+    $content = [string]$response.Content
 
-    $url = "$ReleaseBaseUrl/$FileName"
-    $dest = Join-Path $TargetDir $FileName
-    $tmp  = "$dest.tmp"
+    Write-LogLine -Level 'DEBUG' -Message "Response Status: $($response.StatusCode)"
+    Write-LogLine -Level 'DEBUG' -Message "Response Body: $content"
 
-    try {
-        if (Test-Path -LiteralPath $tmp) {
-            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-        }
-
-        Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing -ErrorAction Stop
-        Test-DownloadedFileLooksValid -Path $tmp
-
-        if ($dest -ieq $CurrentScriptPath) {
-            $pending = "$dest.pending"
-            Move-Item -LiteralPath $tmp -Destination $pending -Force -ErrorAction Stop
-            return [PSCustomObject]@{
-                File    = $FileName
-                Success = $true
-                Error   = ''
-                StagedAsPending = $true
-            }
-        }
-
-        $backup = "$dest.bak"
-        if (Test-Path -LiteralPath $dest) {
-            Copy-Item -LiteralPath $dest -Destination $backup -Force -ErrorAction Stop
-        }
-        Move-Item -LiteralPath $tmp -Destination $dest -Force -ErrorAction Stop
-
-        return [PSCustomObject]@{
-            File    = $FileName
-            Success = $true
-            Error   = ''
-            StagedAsPending = $false
-        }
-    }
-    catch {
-        if (Test-Path -LiteralPath $tmp) {
-            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-        }
-
-        return [PSCustomObject]@{
-            File    = $FileName
-            Success = $false
-            Error   = (Get-WebErrorMessage -Exception $_.Exception -Url $url)
-            StagedAsPending = $false
-        }
+    return [PSCustomObject]@{
+        StatusCode = [int]$response.StatusCode
+        Content    = $content
     }
 }
+
+Initialize-Log
+
+$successFiles = New-Object System.Collections.Generic.List[string]
+$failedFiles  = New-Object System.Collections.Generic.List[string]
+$errorDetails = New-Object System.Collections.Generic.List[string]
 
 try {
-    Ensure-TargetDirectory
-    $currentScriptPath = Get-CurrentScriptPath
+    Promote-PendingUpdaterIfExists
 
-    Promote-PendingAssets -CurrentScriptPath $currentScriptPath
-    Maybe-Promote-SelfPending -CurrentScriptPath $currentScriptPath
+    $config = Load-VirgoConfig
+    $endpoint = Get-EffectiveEndpoint -Config $config
+    $uuid = Get-DeviceUuid
+    $customerGroup = Get-CustomerGroup
 
-    $config = Read-ProtectedConfig
-    $endpoint = [string]$config.Endpoint
-    $deviceSecret = [string]$config.Secret
-    $customerGroup = [Environment]::GetEnvironmentVariable('VIRGO_CUSTOMER_GROUP', 'Machine')
-    if ([string]::IsNullOrWhiteSpace($customerGroup)) {
-        $customerGroup = ''
+    Write-Info "UpdaterVersion: $UpdaterVersion"
+    Write-Info "UUID: $uuid"
+    Write-Info "CustomerGroup: $customerGroup"
+
+    $tmpHealth  = Join-Path $env:TEMP ('virgo_health_'  + [guid]::NewGuid().ToString('N') + '.tmp')
+    $tmpUpdater = Join-Path $env:TEMP ('virgo_updater_' + [guid]::NewGuid().ToString('N') + '.tmp')
+
+    # 1) health script 更新
+    try {
+        Download-ReleaseAsset -Url $HealthReleaseUrl -DestinationTemp $tmpHealth
+
+        $newHash = Get-FileSha256 -Path $tmpHealth
+        $oldHash = Get-FileSha256 -Path $HealthPath
+
+        if ($newHash -and $oldHash -and $newHash -eq $oldHash) {
+            Write-Info 'poc_health_report.ps1 は最新です。'
+        } else {
+            Copy-Item -LiteralPath $tmpHealth -Destination $HealthPath -Force
+            Write-Ok 'poc_health_report.ps1 を更新しました。'
+        }
+
+        $successFiles.Add('poc_health_report.ps1') | Out-Null
+    }
+    catch {
+        $msg = "poc_health_report.ps1 更新失敗: $($_.Exception.Message)"
+        Write-Err $msg
+        $failedFiles.Add('poc_health_report.ps1') | Out-Null
+        $errorDetails.Add($msg) | Out-Null
+    }
+    finally {
+        Remove-Item -LiteralPath $tmpHealth -Force -ErrorAction SilentlyContinue
     }
 
-    $uuid = Get-DeviceUuid
+    # 2) updater 自身の更新
+    try {
+        Download-ReleaseAsset -Url $UpdaterReleaseUrl -DestinationTemp $tmpUpdater
 
-    $results = New-Object System.Collections.Generic.List[object]
-    foreach ($file in $FilesToDeploy) {
-        Write-Info "更新取得中: $file"
-        $result = Download-And-StageAsset -FileName $file -CurrentScriptPath $currentScriptPath
-        $results.Add($result)
+        $newHash = Get-FileSha256 -Path $tmpUpdater
+        $oldHash = Get-FileSha256 -Path $UpdaterPath
 
-        if ($result.Success) {
-            if ($result.StagedAsPending) {
-                Write-Ok "$file は .pending として保留更新しました。"
-            } else {
-                Write-Ok "$file を更新しました。"
-            }
+        if ($newHash -and $oldHash -and $newHash -eq $oldHash) {
+            Write-Info 'update_opscheck_from_github.ps1 は最新です。'
         } else {
-            Write-Warn "$file の更新に失敗しました。$($result.Error)"
+            Copy-Item -LiteralPath $tmpUpdater -Destination $PendingPath -Force
+            Write-Ok 'updater 自身の新バージョンを .pending に保存しました。'
+        }
+
+        $successFiles.Add('update_opscheck_from_github.ps1') | Out-Null
+    }
+    catch {
+        $msg = "update_opscheck_from_github.ps1 更新失敗: $($_.Exception.Message)"
+        Write-Err $msg
+        $failedFiles.Add('update_opscheck_from_github.ps1') | Out-Null
+        $errorDetails.Add($msg) | Out-Null
+    }
+    finally {
+        Remove-Item -LiteralPath $tmpUpdater -Force -ErrorAction SilentlyContinue
+    }
+
+    $message =
+        if ($failedFiles.Count -eq 0) {
+            '更新処理完了: すべて成功'
+        } elseif ($successFiles.Count -gt 0) {
+            '更新処理完了: 一部成功'
+        } else {
+            '更新処理失敗: すべて失敗'
+        }
+
+    $updateLogPayload = @{
+        action        = 'updateLog'
+        device        = $env:COMPUTERNAME
+        customerGroup = $customerGroup
+        uuid          = $uuid
+        timestamp     = (Get-Date).ToString('yyyy/MM/dd HH:mm:ss')
+        updaterVer    = $UpdaterVersion
+        message       = $message
+        successCount  = $successFiles.Count
+        successFiles  = @($successFiles.ToArray())
+        failedCount   = $failedFiles.Count
+        failedFiles   = @($failedFiles.ToArray())
+        errors        = ($errorDetails -join ' | ')
+    }
+
+    try {
+        $res = Send-UpdateLogToGas -Endpoint $endpoint -Secret ([string]$config.secret) -Uuid $uuid -InnerPayload $updateLogPayload
+        if ($res.StatusCode -eq 200 -and $res.Content -match '^ok') {
+            Write-Ok 'updateLog の送信に成功しました。'
+        } else {
+            Write-Warn "updateLog 応答が想定外です: $($res.Content)"
         }
     }
-
-    $successes = @($results | Where-Object { $_.Success })
-    $failures  = @($results | Where-Object { -not $_.Success })
-
-    $successFiles = ($successes | ForEach-Object { $_.File }) -join ', '
-    $failedFiles  = ($failures  | ForEach-Object { $_.File }) -join ', '
-    $errors       = ($failures  | ForEach-Object { "$($_.File): $($_.Error)" }) -join ' | '
-
-    $message = if ($failures.Count -eq 0) {
-        '更新処理完了: すべて成功'
-    } else {
-        '更新処理完了: 一部失敗'
+    catch {
+        Write-Warn "updateLog 送信失敗: $($_.Exception.Message)"
     }
-
-    Send-UpdateLog `
-        -Endpoint $endpoint `
-        -DeviceSecret $deviceSecret `
-        -Uuid $uuid `
-        -CustomerGroup $customerGroup `
-        -Message $message `
-        -SuccessCount $successes.Count `
-        -SuccessFiles $successFiles `
-        -FailedCount $failures.Count `
-        -FailedFiles $failedFiles `
-        -Errors $errors
-
-    if ($failures.Count -gt 0) {
-        exit 1
-    }
-
-    exit 0
 }
 catch {
-    Write-Host "[ERROR] $($_.Exception.Message)" -ForegroundColor Red
+    Write-Err $_.Exception.Message
+    Write-LogLine -Level 'ERROR' -Message ($_ | Out-String)
     exit 1
 }
