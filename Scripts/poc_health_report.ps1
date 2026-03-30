@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.1
 <#
-Virgo Standard/Lite - poc_health_report.ps1
+Virgo Standard / Lite - poc_health_report.ps1
 
 目的:
 - PCの健康状態を収集
@@ -8,6 +8,11 @@ Virgo Standard/Lite - poc_health_report.ps1
 - HMAC-SHA256 署名付きで GAS に送信
 - ログは C:\OpsCheck\poc_health_report.log
 - ログ内のデプロイURLは自動マスク
+
+今回の修正:
+- Hasleo 未導入なら Hasleo stale 判定を行わない
+- volumes / diskHealth を旧UI・新UIの両対応スキーマで送信
+- smartctl が使える場合は温度 / 使用時間を補完
 #>
 
 Set-StrictMode -Version Latest
@@ -71,6 +76,7 @@ function Write-LogLine {
 
     $safeMessage = Mask-SensitiveText -Text $Message
     $line = "{0} [{1}] {2}" -f (Get-NowText), $Level.ToUpper().PadRight(5), $safeMessage
+
     try {
         Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
     } catch {}
@@ -79,11 +85,6 @@ function Write-LogLine {
 function Write-Info {
     param([string]$Message)
     Write-LogLine -Level 'INFO' -Message $Message
-}
-
-function Write-Ok {
-    param([string]$Message)
-    Write-LogLine -Level 'OK' -Message $Message
 }
 
 function Write-Warn {
@@ -96,26 +97,9 @@ function Write-Err {
     Write-LogLine -Level 'ERROR' -Message $Message
 }
 
-function Get-DeviceUuid {
-    try {
-        $uuid = (Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction Stop).UUID
-        if (-not [string]::IsNullOrWhiteSpace($uuid)) {
-            return $uuid.Trim()
-        }
-    } catch {
-        Write-Warn "Get-CimInstance UUID failed: $($_.Exception.Message)"
-    }
-
-    try {
-        $uuid = (Get-WmiObject Win32_ComputerSystemProduct -ErrorAction Stop).UUID
-        if (-not [string]::IsNullOrWhiteSpace($uuid)) {
-            return $uuid.Trim()
-        }
-    } catch {
-        Write-Warn "Get-WmiObject UUID failed: $($_.Exception.Message)"
-    }
-
-    throw 'UUID の取得に失敗しました。'
+function Write-Ok {
+    param([string]$Message)
+    Write-LogLine -Level 'OK' -Message $Message
 }
 
 function Load-VirgoConfig {
@@ -157,30 +141,60 @@ function Get-EffectiveEndpoint {
 
 function Get-CustomerGroup {
     $group = [Environment]::GetEnvironmentVariable('VIRGO_CUSTOMER_GROUP', 'Machine')
-    if (-not [string]::IsNullOrWhiteSpace($group)) {
-        return $group.Trim()
+    if ([string]::IsNullOrWhiteSpace($group)) {
+        throw 'Machine環境変数 VIRGO_CUSTOMER_GROUP が未設定です。'
     }
-    return $env:COMPUTERNAME
+    return $group.Trim()
+}
+
+function Get-DeviceUuid {
+    try {
+        $uuid = (Get-CimInstance Win32_ComputerSystemProduct -ErrorAction Stop).UUID
+        if ([string]::IsNullOrWhiteSpace($uuid)) {
+            throw 'UUID が空です。'
+        }
+        return ([string]$uuid).Trim()
+    }
+    catch {
+        throw "UUID の取得に失敗しました: $($_.Exception.Message)"
+    }
 }
 
 function Get-WindowsRelease {
     try {
         $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
-        if ($cv.DisplayVersion) { return [string]$cv.DisplayVersion }
-        if ($cv.ReleaseId)      { return [string]$cv.ReleaseId }
-        return [string]$cv.CurrentBuild
-    } catch {
-        Write-Warn "Windows version read failed: $($_.Exception.Message)"
-        return ''
+        $displayVersion = [string]$cv.DisplayVersion
+        $currentBuild   = [string]$cv.CurrentBuild
+        $ubr            = [string]$cv.UBR
+
+        if (-not [string]::IsNullOrWhiteSpace($displayVersion)) {
+            return $displayVersion
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($currentBuild)) {
+            if (-not [string]::IsNullOrWhiteSpace($ubr)) {
+                return "$currentBuild.$ubr"
+            }
+            return $currentBuild
+        }
     }
+    catch {
+        Write-Warn "Windows release read failed: $($_.Exception.Message)"
+    }
+
+    return ''
 }
 
 function Convert-FromSecurityCenterProductState {
     param([int]$ProductState)
 
-    # 大まかな判定で十分
-    if ($ProductState -eq 0) { return $false }
-    return $true
+    try {
+        $enabledNibble = (($ProductState -shr 12) -band 0xF)
+        return ($enabledNibble -in 1, 2, 3, 5, 6, 7)
+    }
+    catch {
+        return $false
+    }
 }
 
 function Get-AntivirusInfo {
@@ -205,15 +219,18 @@ function Get-AntivirusInfo {
                 if (-not [string]::IsNullOrWhiteSpace($name)) {
                     $displayNames += $name.Trim()
                 }
+
                 if ($name -match 'ESET') {
                     $result.ESETInstalled = $true
                 }
+
                 if (Convert-FromSecurityCenterProductState -ProductState ([int]$p.productState)) {
                     $result.AntivirusDetected = $true
                 }
             }
         }
-    } catch {
+    }
+    catch {
         Write-Warn "SecurityCenter2 AntiVirusProduct read failed: $($_.Exception.Message)"
     }
 
@@ -222,18 +239,21 @@ function Get-AntivirusInfo {
         $result.AntivirusVendor = $displayNames[0]
         $result.AntivirusLatestEvidence = (Get-Date).ToString('yyyy/MM/dd HH:mm:ss')
         $result.AntivirusEvidenceStale = $false
-    } else {
+    }
+    else {
         try {
             $def = Get-MpComputerStatus -ErrorAction Stop
-            $result.AntivirusProducts = 'Microsoft Defender'
-            $result.AntivirusVendor = 'Microsoft Defender'
+            $result.AntivirusProducts = 'Windows Defender'
+            $result.AntivirusVendor = 'Windows Defender'
             $result.AntivirusDetected = [bool]$def.AntivirusEnabled
+
             if ($def.AntivirusSignatureLastUpdated) {
                 $result.AntivirusLatestEvidence = ([datetime]$def.AntivirusSignatureLastUpdated).ToString('yyyy/MM/dd HH:mm:ss')
                 $age = (New-TimeSpan -Start ([datetime]$def.AntivirusSignatureLastUpdated) -End (Get-Date)).TotalDays
                 $result.AntivirusEvidenceStale = ($age -gt 14)
             }
-        } catch {
+        }
+        catch {
             Write-Warn "Defender status read failed: $($_.Exception.Message)"
         }
     }
@@ -241,66 +261,246 @@ function Get-AntivirusInfo {
     return [PSCustomObject]$result
 }
 
-function Get-VolumeInfo {
-    $volumes = @()
+function Get-LogicalDisks {
     try {
-        $items = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" -ErrorAction Stop
-        foreach ($v in $items) {
-            $size = [double]($v.Size)
-            $free = [double]($v.FreeSpace)
-            $usedPct = if ($size -gt 0) { [math]::Round((($size - $free) / $size) * 100, 1) } else { 0 }
-            $freeGb = if ($free -gt 0) { [math]::Round($free / 1GB, 1) } else { 0 }
+        return @(Get-CimInstance Win32_LogicalDisk -Filter "DriveType=2 OR DriveType=3" -ErrorAction Stop)
+    }
+    catch {
+        Write-Warn "Logical disk read failed: $($_.Exception.Message)"
+        return @()
+    }
+}
 
-            $volumes += [ordered]@{
-                driveLetter = [string]$v.DeviceID
-                volumeName  = [string]$v.VolumeName
+function Get-VolumeInfo {
+    param(
+        [Parameter(Mandatory = $true)][array]$LogicalDisks
+    )
+
+    $volumes = @()
+
+    foreach ($v in $LogicalDisks) {
+        try {
+            if (-not $v.Size -or [double]$v.Size -le 0) { continue }
+
+            $driveLetter = [string]$v.DeviceID
+            $volumeName  = [string]$v.VolumeName
+            $sizeBytes   = [double]$v.Size
+            $freeBytes   = [double]$v.FreeSpace
+
+            $sizeGb = [math]::Round(($sizeBytes / 1GB), 1)
+            $freeGb = [math]::Round(($freeBytes / 1GB), 1)
+            $usedGb = [math]::Round(($sizeGb - $freeGb), 1)
+            $usedPct = if ($sizeGb -gt 0) {
+                [math]::Round((($usedGb / $sizeGb) * 100), 1)
+            } else {
+                0
+            }
+
+            $volumes += [PSCustomObject]@{
+                # 旧管理画面向け
+                driveLetter = $driveLetter
+                volumeName  = $volumeName
                 freeGb      = $freeGb
                 usedPct     = $usedPct
+
+                # 新顧客画面向け
+                Drive       = $driveLetter.TrimEnd(':')
+                SizeGB      = $sizeGb
+                UsedGB      = $usedGb
+                FreeGB      = $freeGb
+                IsBackup    = $false
+                IsTarget    = ($driveLetter -eq 'C:')
+                SmartHealth = '正常'
             }
         }
-    } catch {
-        Write-Warn "Volume info read failed: $($_.Exception.Message)"
+        catch {
+            Write-Warn "Volume item read failed: $($_.Exception.Message)"
+        }
     }
-    return $volumes
+
+    return @($volumes)
+}
+
+function Parse-SmartctlDeviceBlock {
+    param(
+        [Parameter(Mandatory = $true)][string]$Text
+    )
+
+    $model = ''
+    $status = '不明'
+    $temp = '不明'
+    $hours = '不明'
+
+    $m = [regex]::Match($Text, '(?m)^Device Model:\s*(.+)$')
+    if (-not $m.Success) { $m = [regex]::Match($Text, '(?m)^Model Family:\s*(.+)$') }
+    if (-not $m.Success) { $m = [regex]::Match($Text, '(?m)^Product:\s*(.+)$') }
+    if ($m.Success) { $model = $m.Groups[1].Value.Trim() }
+
+    $m = [regex]::Match($Text, '(?m)^SMART overall-health self-assessment test result:\s*(.+)$')
+    if ($m.Success) {
+        $status = $m.Groups[1].Value.Trim()
+    }
+    else {
+        $m = [regex]::Match($Text, '(?m)^SMART Health Status:\s*(.+)$')
+        if ($m.Success) {
+            $status = $m.Groups[1].Value.Trim()
+        }
+    }
+
+    $m = [regex]::Match($Text, '(?m)^(194|190)\s+\S+.*?\s+(\d+)\s*$')
+    if ($m.Success) {
+        $temp = $m.Groups[2].Value.Trim()
+    }
+    else {
+        $m = [regex]::Match($Text, '(?m)^Temperature:\s*(\d+)')
+        if ($m.Success) {
+            $temp = $m.Groups[1].Value.Trim()
+        }
+    }
+
+    $m = [regex]::Match($Text, '(?m)^9\s+\S+.*?\s+(\d+)\s*$')
+    if ($m.Success) {
+        $hours = $m.Groups[1].Value.Trim()
+    }
+    else {
+        $m = [regex]::Match($Text, '(?m)^Power_On_Hours.*?(\d+)\s*$')
+        if ($m.Success) {
+            $hours = $m.Groups[1].Value.Trim()
+        }
+    }
+
+    [PSCustomObject]@{
+        Model        = if ($model) { $model } else { 'Unknown' }
+        Status       = if ($status) { $status } else { '不明' }
+        Temperature  = if ($temp) { $temp } else { '不明' }
+        PowerOnHours = if ($hours) { $hours } else { '不明' }
+    }
+}
+
+function Get-SmartctlDiskHealthInfo {
+    $smartctl = Join-Path $BaseDir 'smartmontools\bin\smartctl.exe'
+    $result = @()
+
+    if (-not (Test-Path -LiteralPath $smartctl)) {
+        Write-Warn "smartctl not found: $smartctl"
+        return @()
+    }
+
+    Write-Info "smartctl found: $smartctl"
+
+    try {
+        $scan = & $smartctl --scan 2>$null
+        if (-not $scan) {
+            return @()
+        }
+
+        foreach ($line in $scan) {
+            $scanLine = [string]$line
+            if ([string]::IsNullOrWhiteSpace($scanLine)) { continue }
+
+            $devicePath = ($scanLine -split '\s+')[0]
+            if ([string]::IsNullOrWhiteSpace($devicePath)) { continue }
+
+            try {
+                $text = (& $smartctl -a $devicePath 2>$null) -join [Environment]::NewLine
+                if ([string]::IsNullOrWhiteSpace($text)) { continue }
+
+                $parsed = Parse-SmartctlDeviceBlock -Text $text
+                $result += [PSCustomObject]@{
+                    model             = $parsed.Model
+                    mediaType         = 'Unknown'
+                    healthStatus      = $parsed.Status
+                    operationalStatus = 'OK'
+
+                    Model             = $parsed.Model
+                    Status            = $parsed.Status
+                    Temperature       = $parsed.Temperature
+                    PowerOnHours      = $parsed.PowerOnHours
+                }
+            }
+            catch {
+                Write-Warn "smartctl parse failed for $devicePath : $($_.Exception.Message)"
+            }
+        }
+    }
+    catch {
+        Write-Warn "smartctl scan failed: $($_.Exception.Message)"
+    }
+
+    return @($result)
+}
+
+function Merge-DiskHealthInfo {
+    param(
+        [Parameter(Mandatory = $true)][array]$PhysicalDisks,
+        [Parameter(Mandatory = $true)][array]$SmartctlDisks
+    )
+
+    $merged = @()
+
+    if ($SmartctlDisks.Count -gt 0) {
+        return @($SmartctlDisks)
+    }
+
+    foreach ($d in $PhysicalDisks) {
+        $statusText = [string]$d.healthStatus
+        if ([string]::IsNullOrWhiteSpace($statusText)) { $statusText = '不明' }
+
+        $merged += [PSCustomObject]@{
+            model             = [string]$d.model
+            mediaType         = [string]$d.mediaType
+            healthStatus      = $statusText
+            operationalStatus = [string]$d.operationalStatus
+
+            Model             = [string]$d.model
+            Status            = $statusText
+            Temperature       = '不明'
+            PowerOnHours      = '不明'
+        }
+    }
+
+    return @($merged)
 }
 
 function Get-DiskHealthInfo {
-    $disks = @()
+    $physical = @()
 
     try {
         $physicalDisks = Get-PhysicalDisk -ErrorAction Stop
         foreach ($d in $physicalDisks) {
             $health = [string]$d.HealthStatus
-            $disks += [ordered]@{
-                model        = [string]$d.FriendlyName
-                mediaType    = [string]$d.MediaType
-                healthStatus = $health
+            $physical += [PSCustomObject]@{
+                model             = [string]$d.FriendlyName
+                mediaType         = [string]$d.MediaType
+                healthStatus      = $health
                 operationalStatus = ([string]($d.OperationalStatus -join ', '))
+
+                Model             = [string]$d.FriendlyName
+                Status            = $health
+                Temperature       = '不明'
+                PowerOnHours      = '不明'
             }
         }
-    } catch {
+    }
+    catch {
         Write-Warn "Get-PhysicalDisk failed: $($_.Exception.Message)"
     }
 
-    $smartctl = Join-Path $BaseDir 'smartmontools\bin\smartctl.exe'
-    if (Test-Path -LiteralPath $smartctl) {
-        Write-Info "smartctl found: $smartctl"
-    } else {
-        Write-Warn "smartctl not found: $smartctl"
-    }
-
-    return $disks
+    $smart = Get-SmartctlDiskHealthInfo
+    return @(Merge-DiskHealthInfo -PhysicalDisks $physical -SmartctlDisks $smart)
 }
 
 function Get-RecentFileDate {
     param(
         [Parameter(Mandatory = $true)][string[]]$RootPaths,
-        [Parameter(Mandatory = $true)][string[]]$Patterns
+        [Parameter(Mandatory = $true)][string[]]$Patterns,
+        [int]$Depth = 4
     )
 
     $latest = $null
 
     foreach ($root in $RootPaths) {
+        if ([string]::IsNullOrWhiteSpace($root)) { continue }
         if (-not (Test-Path -LiteralPath $root)) { continue }
 
         foreach ($pattern in $Patterns) {
@@ -311,7 +511,9 @@ function Get-RecentFileDate {
                         $latest = $f.LastWriteTime
                     }
                 }
-            } catch {}
+            }
+            catch {
+            }
         }
     }
 
@@ -319,6 +521,10 @@ function Get-RecentFileDate {
 }
 
 function Get-BackupInfo {
+    param(
+        [Parameter(Mandatory = $true)][array]$LogicalDisks
+    )
+
     $result = [ordered]@{
         MacriumInstalled   = $false
         MacriumLatestLog   = ''
@@ -326,45 +532,162 @@ function Get-BackupInfo {
         HasleoInstalled    = $false
         HasleoLatestImage  = ''
         HasleoImageStale   = $false
+        BackupMonitorMode  = 'ReflectOnly'
+        BackupTargetDrives = @()
     }
+
+    $rootCandidates = @()
+    foreach ($disk in $LogicalDisks) {
+        $root = [string]$disk.DeviceID
+        if ($root -match '^[A-Z]:$') {
+            $rootCandidates += "$root\"
+        }
+    }
+
+    $macriumInstalled =
+        (Test-Path 'C:\Program Files\Macrium') -or
+        (Test-Path 'C:\Program Files\Macrium\Reflect') -or
+        (Get-Service -Name 'MacriumService' -ErrorAction SilentlyContinue) -or
+        (Get-ScheduledTask -TaskName '*Macrium*' -ErrorAction SilentlyContinue)
+
+    $hasleoInstalled =
+        (Test-Path 'C:\Program Files\Hasleo') -or
+        (Test-Path 'C:\Program Files\Hasleo Backup Suite') -or
+        (Get-Service -Name 'Hasleo*' -ErrorAction SilentlyContinue) -or
+        (Get-ScheduledTask -TaskName '*Hasleo*' -ErrorAction SilentlyContinue)
+
+    $result.MacriumInstalled = [bool]$macriumInstalled
+    $result.HasleoInstalled  = [bool]$hasleoInstalled
 
     $macriumRoots = @(
         'C:\ProgramData\Macrium',
         'C:\Reflect',
-        'C:\Backup',
-        'D:\',
-        'E:\'
-    )
-
-    $hasleoRoots = @(
-        'C:\Program Files\Hasleo',
-        'C:\ProgramData\Hasleo',
-        'C:\Backup',
-        'D:\',
-        'E:\'
-    )
-
-    if (Test-Path 'C:\Program Files\Macrium') {
-        $result.MacriumInstalled = $true
-    }
-
-    if (Test-Path 'C:\Program Files\Hasleo') {
-        $result.HasleoInstalled = $true
-    }
+        'C:\Backup'
+    ) + $rootCandidates
 
     $latestMacrium = Get-RecentFileDate -RootPaths $macriumRoots -Patterns @('*.mrimg', '*.html', '*.log')
     if ($latestMacrium) {
         $result.MacriumLatestLog = ([datetime]$latestMacrium).ToString('yyyy/MM/dd HH:mm:ss')
         $result.ReflectImageStale = ((New-TimeSpan -Start ([datetime]$latestMacrium) -End (Get-Date)).TotalDays -gt 14)
     }
-
-    $latestHasleo = Get-RecentFileDate -RootPaths $hasleoRoots -Patterns @('*.hbi', '*.adi', '*.log')
-    if ($latestHasleo) {
-        $result.HasleoLatestImage = ([datetime]$latestHasleo).ToString('yyyy/MM/dd HH:mm:ss')
-        $result.HasleoImageStale = ((New-TimeSpan -Start ([datetime]$latestHasleo) -End (Get-Date)).TotalDays -gt 14)
+    elseif ($result.MacriumInstalled) {
+        # インストール済みなのに痕跡なし → ここでは stale にせず、未取得扱い
+        $result.MacriumLatestLog = ''
+        $result.ReflectImageStale = $false
     }
 
+    if ($result.HasleoInstalled) {
+        $result.BackupMonitorMode = if ($result.MacriumInstalled) { 'ReflectAndHasleo' } else { 'HasleoOnly' }
+
+        $hasleoRoots = @(
+            'C:\Program Files\Hasleo',
+            'C:\Program Files\Hasleo Backup Suite',
+            'C:\ProgramData\Hasleo',
+            'C:\Backup'
+        ) + $rootCandidates
+
+        $latestHasleo = Get-RecentFileDate -RootPaths $hasleoRoots -Patterns @('*.hbi', '*.adi', '*.pbd', '*.log')
+        if ($latestHasleo) {
+            $result.HasleoLatestImage = ([datetime]$latestHasleo).ToString('yyyy/MM/dd HH:mm:ss')
+            $result.HasleoImageStale = ((New-TimeSpan -Start ([datetime]$latestHasleo) -End (Get-Date)).TotalDays -gt 14)
+        }
+        else {
+            $result.HasleoLatestImage = ''
+            $result.HasleoImageStale = $false
+        }
+    }
+    else {
+        # 未導入なら stale を立てない
+        $result.HasleoLatestImage = ''
+        $result.HasleoImageStale = $false
+        $result.BackupMonitorMode = if ($result.MacriumInstalled) { 'ReflectOnly' } else { 'None' }
+    }
+
+    # バックアップドライブ判定
+    $targetDrives = New-Object System.Collections.Generic.List[string]
+
+    foreach ($disk in $LogicalDisks) {
+        try {
+            $drive = [string]$disk.DeviceID
+            if (-not $drive) { continue }
+
+            if ($drive -eq 'C:') {
+                $targetDrives.Add($drive)
+                continue
+            }
+
+            $root = "$drive\"
+            $isBackup = $false
+
+            if ($result.MacriumInstalled) {
+                $hasMrimg = Get-ChildItem -Path $root -Filter '*.mrimg' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($hasMrimg) { $isBackup = $true }
+            }
+
+            if (-not $isBackup -and $result.HasleoInstalled) {
+                $hasHasleo = Get-ChildItem -Path $root -Include '*.hbi', '*.adi', '*.pbd' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($hasHasleo) { $isBackup = $true }
+            }
+
+            if ($isBackup) {
+                $targetDrives.Add($drive)
+            }
+        }
+        catch {
+        }
+    }
+
+    $result.BackupTargetDrives = @($targetDrives | Select-Object -Unique)
     return [PSCustomObject]$result
+}
+
+function Apply-BackupFlagsToVolumes {
+    param(
+        [Parameter(Mandatory = $true)][array]$Volumes,
+        [Parameter(Mandatory = $true)]$BackupInfo
+    )
+
+    $targets = @($BackupInfo.BackupTargetDrives | ForEach-Object {
+        ([string]$_).TrimEnd(':').ToUpperInvariant()
+    })
+
+    foreach ($v in $Volumes) {
+        $driveKey = [string]$v.Drive
+        $isBackup = $targets -contains $driveKey.ToUpperInvariant()
+        $isTarget = ($driveKey -eq 'C') -or $isBackup
+
+        $v.IsBackup = $isBackup
+        $v.IsTarget = $isTarget
+    }
+
+    return @($Volumes)
+}
+
+function Apply-SmartStatusToVolumes {
+    param(
+        [Parameter(Mandatory = $true)][array]$Volumes,
+        [Parameter(Mandatory = $true)][array]$DiskHealth
+    )
+
+    $globalSmart = '正常'
+    $warnCount = @(
+        $DiskHealth | Where-Object {
+            $s = [string]$_.Status
+            $h = [string]$_.healthStatus
+            ($s -and $s -notin @('PASSED', 'OK', 'Healthy', '正常', '不明')) -or
+            ($h -and $h -notin @('PASSED', 'OK', 'Healthy', '正常', '不明'))
+        }
+    ).Count
+
+    if ($warnCount -gt 0) {
+        $globalSmart = '要注意'
+    }
+
+    foreach ($v in $Volumes) {
+        $v.SmartHealth = $globalSmart
+    }
+
+    return @($Volumes)
 }
 
 function Get-HealthStatusAndAlerts {
@@ -385,8 +708,17 @@ function Get-HealthStatusAndAlerts {
     }
 
     foreach ($d in $DiskHealth) {
-        if (($d.healthStatus -ne 'Healthy') -and ($d.healthStatus -ne '正常') -and (-not [string]::IsNullOrWhiteSpace($d.healthStatus))) {
-            $alerts.Add("Disk health warning: $($d.model) / $($d.healthStatus)")
+        $h = [string]$d.healthStatus
+        $s = [string]$d.Status
+
+        $statusToCheck = if (-not [string]::IsNullOrWhiteSpace($h)) { $h } else { $s }
+
+        if (
+            (-not [string]::IsNullOrWhiteSpace($statusToCheck)) -and
+            ($statusToCheck -notin @('Healthy', '正常', 'PASSED', 'OK', '不明'))
+        ) {
+            $model = if ($d.model) { $d.model } elseif ($d.Model) { $d.Model } else { 'Unknown' }
+            $alerts.Add("Disk health warning: $model / $statusToCheck")
         }
     }
 
@@ -394,11 +726,11 @@ function Get-HealthStatusAndAlerts {
         $alerts.Add('Antivirus not detected')
     }
 
-    if ([bool]$Backup.ReflectImageStale) {
+    if ([bool]$Backup.MacriumInstalled -and [bool]$Backup.ReflectImageStale) {
         $alerts.Add('Reflect backup stale')
     }
 
-    if ([bool]$Backup.HasleoImageStale) {
+    if ([bool]$Backup.HasleoInstalled -and [bool]$Backup.HasleoImageStale) {
         $alerts.Add('Hasleo backup stale')
     }
 
@@ -468,7 +800,14 @@ function Invoke-SignedPost {
     Write-LogLine -Level 'DEBUG' -Message "POST Endpoint: $Endpoint"
     Write-LogLine -Level 'DEBUG' -Message "POST Body: $(Mask-SensitiveText -Text $outerJson)"
 
-    $response = Invoke-WebRequest -Uri $Endpoint -Method Post -ContentType 'application/json; charset=utf-8' -Body $bodyBytes -UseBasicParsing -ErrorAction Stop
+    $response = Invoke-WebRequest `
+        -Uri $Endpoint `
+        -Method Post `
+        -ContentType 'application/json; charset=utf-8' `
+        -Body $bodyBytes `
+        -UseBasicParsing `
+        -ErrorAction Stop
+
     $content = [string]$response.Content
 
     Write-LogLine -Level 'DEBUG' -Message "Response Status: $($response.StatusCode)"
@@ -490,15 +829,24 @@ try {
     $customerGroup = Get-CustomerGroup
 
     Write-Ok 'config.dpapi の復号に成功しました。'
-    Write-Info "Endpoint resolved"
+    Write-Info 'Endpoint resolved'
     Write-Info "UUID: $uuid"
     Write-Info "CustomerGroup: $customerGroup"
 
+    $logicalDisks = Get-LogicalDisks
     $antivirus = Get-AntivirusInfo
-    $volumes = Get-VolumeInfo
+    $volumes = Get-VolumeInfo -LogicalDisks $logicalDisks
     $diskHealth = Get-DiskHealthInfo
-    $backup = Get-BackupInfo
-    $health = Get-HealthStatusAndAlerts -Volumes $volumes -DiskHealth $diskHealth -Antivirus $antivirus -Backup $backup
+    $backup = Get-BackupInfo -LogicalDisks $logicalDisks
+
+    $volumes = Apply-BackupFlagsToVolumes -Volumes $volumes -BackupInfo $backup
+    $volumes = Apply-SmartStatusToVolumes -Volumes $volumes -DiskHealth $diskHealth
+
+    $health = Get-HealthStatusAndAlerts `
+        -Volumes $volumes `
+        -DiskHealth $diskHealth `
+        -Antivirus $antivirus `
+        -Backup $backup
 
     $payload = [ordered]@{
         timestamp                = (Get-Date).ToString('yyyy/MM/dd HH:mm:ss')
@@ -508,7 +856,7 @@ try {
         pcLocation               = ''
         pcUser                   = $env:USERNAME
         device                   = $env:COMPUTERNAME
-        scriptVersion            = 'virgo-health-v4-logmask-1.0'
+        scriptVersion            = 'virgo-health-v4-logmask-1.1'
         antivirusVendor          = [string]$antivirus.AntivirusVendor
         antivirusProducts        = [string]$antivirus.AntivirusProducts
         antivirusDetected        = [bool]$antivirus.AntivirusDetected
@@ -534,11 +882,16 @@ try {
 
     Write-LogLine -Level 'DEBUG' -Message ("Inner Payload: " + (($payload | ConvertTo-Json -Compress -Depth 12)))
 
-    $res = Invoke-SignedPost -Endpoint $endpoint -Secret ([string]$config.secret) -Uuid $uuid -InnerPayload $payload
+    $res = Invoke-SignedPost `
+        -Endpoint $endpoint `
+        -Secret ([string]$config.secret) `
+        -Uuid $uuid `
+        -InnerPayload $payload
 
     if ($res.StatusCode -eq 200 -and $res.Content -match '^ok') {
         Write-Ok '生データ送信は成功しました。'
-    } else {
+    }
+    else {
         Write-Warn "応答が想定外です: $($res.Content)"
     }
 }
