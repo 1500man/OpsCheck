@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 Virgo Standard / Lite - poc_health_report.ps1
 
@@ -11,8 +11,9 @@ Virgo Standard / Lite - poc_health_report.ps1
 
 今回の修正:
 - Hasleo 未導入なら Hasleo stale 判定を行わない
-- volumes / diskHealth を旧UI・新UIの両対応スキーマで送信
+- volumes / diskHealth を管理画面・顧客画面の両方で使いやすい形式で送信
 - smartctl が使える場合は温度 / 使用時間を補完
+- PowerShell のハッシュ重複キーエラーを解消
 #>
 
 Set-StrictMode -Version Latest
@@ -292,18 +293,16 @@ function Get-VolumeInfo {
             $usedGb = [math]::Round(($sizeGb - $freeGb), 1)
             $usedPct = if ($sizeGb -gt 0) {
                 [math]::Round((($usedGb / $sizeGb) * 100), 1)
-            } else {
+            }
+            else {
                 0
             }
 
             $volumes += [PSCustomObject]@{
-                # 旧管理画面向け
                 driveLetter = $driveLetter
                 volumeName  = $volumeName
-                freeGb      = $freeGb
                 usedPct     = $usedPct
 
-                # 新顧客画面向け
                 Drive       = $driveLetter.TrimEnd(':')
                 SizeGB      = $sizeGb
                 UsedGB      = $usedGb
@@ -369,7 +368,7 @@ function Parse-SmartctlDeviceBlock {
         }
     }
 
-    [PSCustomObject]@{
+    return [PSCustomObject]@{
         Model        = if ($model) { $model } else { 'Unknown' }
         Status       = if ($status) { $status } else { '不明' }
         Temperature  = if ($temp) { $temp } else { '不明' }
@@ -407,12 +406,10 @@ function Get-SmartctlDiskHealthInfo {
 
                 $parsed = Parse-SmartctlDeviceBlock -Text $text
                 $result += [PSCustomObject]@{
-                    model             = $parsed.Model
+                    Model             = $parsed.Model
                     mediaType         = 'Unknown'
                     healthStatus      = $parsed.Status
                     operationalStatus = 'OK'
-
-                    Model             = $parsed.Model
                     Status            = $parsed.Status
                     Temperature       = $parsed.Temperature
                     PowerOnHours      = $parsed.PowerOnHours
@@ -447,12 +444,10 @@ function Merge-DiskHealthInfo {
         if ([string]::IsNullOrWhiteSpace($statusText)) { $statusText = '不明' }
 
         $merged += [PSCustomObject]@{
-            model             = [string]$d.model
+            Model             = [string]$d.Model
             mediaType         = [string]$d.mediaType
             healthStatus      = $statusText
             operationalStatus = [string]$d.operationalStatus
-
-            Model             = [string]$d.model
             Status            = $statusText
             Temperature       = '不明'
             PowerOnHours      = '不明'
@@ -470,12 +465,10 @@ function Get-DiskHealthInfo {
         foreach ($d in $physicalDisks) {
             $health = [string]$d.HealthStatus
             $physical += [PSCustomObject]@{
-                model             = [string]$d.FriendlyName
+                Model             = [string]$d.FriendlyName
                 mediaType         = [string]$d.MediaType
                 healthStatus      = $health
                 operationalStatus = ([string]($d.OperationalStatus -join ', '))
-
-                Model             = [string]$d.FriendlyName
                 Status            = $health
                 Temperature       = '不明'
                 PowerOnHours      = '不明'
@@ -493,8 +486,7 @@ function Get-DiskHealthInfo {
 function Get-RecentFileDate {
     param(
         [Parameter(Mandatory = $true)][string[]]$RootPaths,
-        [Parameter(Mandatory = $true)][string[]]$Patterns,
-        [int]$Depth = 4
+        [Parameter(Mandatory = $true)][string[]]$Patterns
     )
 
     $latest = $null
@@ -512,8 +504,7 @@ function Get-RecentFileDate {
                     }
                 }
             }
-            catch {
-            }
+            catch {}
         }
     }
 
@@ -565,13 +556,12 @@ function Get-BackupInfo {
         'C:\Backup'
     ) + $rootCandidates
 
-    $latestMacrium = Get-RecentFileDate -RootPaths $macriumRoots -Patterns @('*.mrimg', '*.html', '*.log')
+    $latestMacrium = Get-RecentFileDate -RootPaths $macriumRoots -Patterns @('*.mrimg', '*.mrbak', '*.html', '*.log')
     if ($latestMacrium) {
         $result.MacriumLatestLog = ([datetime]$latestMacrium).ToString('yyyy/MM/dd HH:mm:ss')
         $result.ReflectImageStale = ((New-TimeSpan -Start ([datetime]$latestMacrium) -End (Get-Date)).TotalDays -gt 14)
     }
     elseif ($result.MacriumInstalled) {
-        # インストール済みなのに痕跡なし → ここでは stale にせず、未取得扱い
         $result.MacriumLatestLog = ''
         $result.ReflectImageStale = $false
     }
@@ -597,13 +587,11 @@ function Get-BackupInfo {
         }
     }
     else {
-        # 未導入なら stale を立てない
         $result.HasleoLatestImage = ''
         $result.HasleoImageStale = $false
         $result.BackupMonitorMode = if ($result.MacriumInstalled) { 'ReflectOnly' } else { 'None' }
     }
 
-    # バックアップドライブ判定
     $targetDrives = New-Object System.Collections.Generic.List[string]
 
     foreach ($disk in $LogicalDisks) {
@@ -620,7 +608,7 @@ function Get-BackupInfo {
             $isBackup = $false
 
             if ($result.MacriumInstalled) {
-                $hasMrimg = Get-ChildItem -Path $root -Filter '*.mrimg' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                $hasMrimg = Get-ChildItem -Path $root -Include '*.mrimg','*.mrbak' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($hasMrimg) { $isBackup = $true }
             }
 
@@ -633,8 +621,7 @@ function Get-BackupInfo {
                 $targetDrives.Add($drive)
             }
         }
-        catch {
-        }
+        catch {}
     }
 
     $result.BackupTargetDrives = @($targetDrives | Select-Object -Unique)
@@ -702,22 +689,21 @@ function Get-HealthStatusAndAlerts {
     $healthStatus = 'OK'
 
     foreach ($v in $Volumes) {
-        if ($v.driveLetter -eq 'C:' -and [double]$v.freeGb -lt 20) {
-            $alerts.Add("C drive free space low: $($v.freeGb)GB")
+        if ($v.Drive -eq 'C' -and [double]$v.FreeGB -lt 20) {
+            $alerts.Add("C drive free space low: $($v.FreeGB)GB")
         }
     }
 
     foreach ($d in $DiskHealth) {
         $h = [string]$d.healthStatus
         $s = [string]$d.Status
-
         $statusToCheck = if (-not [string]::IsNullOrWhiteSpace($h)) { $h } else { $s }
 
         if (
             (-not [string]::IsNullOrWhiteSpace($statusToCheck)) -and
             ($statusToCheck -notin @('Healthy', '正常', 'PASSED', 'OK', '不明'))
         ) {
-            $model = if ($d.model) { $d.model } elseif ($d.Model) { $d.Model } else { 'Unknown' }
+            $model = if ($d.Model) { $d.Model } else { 'Unknown' }
             $alerts.Add("Disk health warning: $model / $statusToCheck")
         }
     }
@@ -856,7 +842,7 @@ try {
         pcLocation               = ''
         pcUser                   = $env:USERNAME
         device                   = $env:COMPUTERNAME
-        scriptVersion            = 'virgo-health-v4-logmask-1.1'
+        scriptVersion            = 'virgo-health-v4-logmask-1.2'
         antivirusVendor          = [string]$antivirus.AntivirusVendor
         antivirusProducts        = [string]$antivirus.AntivirusProducts
         antivirusDetected        = [bool]$antivirus.AntivirusDetected
