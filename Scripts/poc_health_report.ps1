@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+﻿?#requires -Version 5.1
 <#
 Virgo Standard / Lite - poc_health_report.ps1
 ASCII-safe edition for Windows PowerShell 5.1
@@ -303,6 +303,81 @@ function Get-RecentFileDate {
     return $latest
 }
 
+function Test-IsBlacklistedDiskStatus {
+    param(
+        [string]$Status
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Status)) {
+        return $false
+    }
+
+    $s = $Status.Trim().ToLowerInvariant()
+
+    $blacklist = @(
+        'unhealthy',
+        'error',
+        'bad',
+        'failing',
+        'pred fail',
+        'predfail',
+        'degraded',
+        'failed',
+        'failure',
+        'critical',
+        'fault'
+    )
+
+    foreach ($word in $blacklist) {
+        if ($s -like "*$word*") {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-LatestBackupCandidate {
+    param(
+        [Parameter(Mandatory = $true)][string]$ReflectLatest,
+        [Parameter(Mandatory = $true)][bool]$ReflectInstalled,
+        [Parameter(Mandatory = $true)][string]$HasleoLatest,
+        [Parameter(Mandatory = $true)][bool]$HasleoInstalled
+    )
+
+    $candidates = @()
+
+    if ($ReflectInstalled -and -not [string]::IsNullOrWhiteSpace($ReflectLatest)) {
+        try {
+            $candidates += [PSCustomObject]@{
+                Source = 'Reflect'
+                Date   = [datetime]::Parse($ReflectLatest)
+                Raw    = $ReflectLatest
+            }
+        }
+        catch {
+        }
+    }
+
+    if ($HasleoInstalled -and -not [string]::IsNullOrWhiteSpace($HasleoLatest)) {
+        try {
+            $candidates += [PSCustomObject]@{
+                Source = 'Hasleo'
+                Date   = [datetime]::Parse($HasleoLatest)
+                Raw    = $HasleoLatest
+            }
+        }
+        catch {
+        }
+    }
+
+    if ($candidates.Count -eq 0) {
+        return $null
+    }
+
+    return $candidates | Sort-Object Date -Descending | Select-Object -First 1
+}
+
 function Get-BackupInfo {
     param(
         [Parameter(Mandatory = $true)][array]$Volumes
@@ -316,6 +391,11 @@ function Get-BackupInfo {
         HasleoLatestImage  = ''
         HasleoImageStale   = $false
         BackupTargetDrives = @()
+
+        BackupLatestSource = ''
+        BackupLatestTime   = ''
+        BackupOverallStale = $false
+        BackupOverallOk    = $false
     }
 
     $rootCandidates = @()
@@ -344,9 +424,10 @@ function Get-BackupInfo {
     if ($latestMacriumImage) {
         $result.MacriumLatestLog = ([datetime]$latestMacriumImage).ToString('yyyy/MM/dd HH:mm:ss')
         $result.ReflectImageStale = ((New-TimeSpan -Start ([datetime]$latestMacriumImage) -End (Get-Date)).TotalDays -gt 14)
-    } elseif ($result.MacriumInstalled) {
+    }
+    elseif ($result.MacriumInstalled) {
         $result.MacriumLatestLog = ''
-        $result.ReflectImageStale = $false
+        $result.ReflectImageStale = $true
     }
 
     if ($result.HasleoInstalled) {
@@ -361,13 +442,34 @@ function Get-BackupInfo {
         if ($latestHasleo) {
             $result.HasleoLatestImage = ([datetime]$latestHasleo).ToString('yyyy/MM/dd HH:mm:ss')
             $result.HasleoImageStale = ((New-TimeSpan -Start ([datetime]$latestHasleo) -End (Get-Date)).TotalDays -gt 14)
-        } else {
-            $result.HasleoLatestImage = ''
-            $result.HasleoImageStale = $false
         }
-    } else {
+        else {
+            $result.HasleoLatestImage = ''
+            $result.HasleoImageStale = $true
+        }
+    }
+    else {
         $result.HasleoLatestImage = ''
         $result.HasleoImageStale = $false
+    }
+
+    $latestCandidate = Get-LatestBackupCandidate `
+        -ReflectLatest $result.MacriumLatestLog `
+        -ReflectInstalled $result.MacriumInstalled `
+        -HasleoLatest $result.HasleoLatestImage `
+        -HasleoInstalled $result.HasleoInstalled
+
+    if ($latestCandidate) {
+        $result.BackupLatestSource = [string]$latestCandidate.Source
+        $result.BackupLatestTime   = [string]$latestCandidate.Raw
+        $result.BackupOverallStale = ((New-TimeSpan -Start ([datetime]$latestCandidate.Date) -End (Get-Date)).TotalDays -gt 14)
+        $result.BackupOverallOk    = (-not $result.BackupOverallStale)
+    }
+    else {
+        $result.BackupLatestSource = ''
+        $result.BackupLatestTime   = ''
+        $result.BackupOverallStale = $true
+        $result.BackupOverallOk    = $false
     }
 
     $targetDrives = New-Object System.Collections.Generic.List[string]
@@ -384,12 +486,12 @@ function Get-BackupInfo {
         $isBackup = $false
 
         if ($result.MacriumInstalled) {
-            $hasMr = Get-ChildItem -Path $root -Include '*.mrimg','*.mrbak' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            $hasMr = Get-ChildItem -Path $root -Include '*.mrimg', '*.mrbak' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($hasMr) { $isBackup = $true }
         }
 
         if (-not $isBackup -and $result.HasleoInstalled) {
-            $hasHasleo = Get-ChildItem -Path $root -Include '*.hbi','*.adi','*.pbd' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            $hasHasleo = Get-ChildItem -Path $root -Include '*.hbi', '*.adi', '*.pbd' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($hasHasleo) { $isBackup = $true }
         }
 
@@ -429,9 +531,14 @@ function Apply-SmartStatusToVolumes {
     )
 
     $globalSmart = 'OK'
+
     foreach ($d in $DiskHealth) {
-        $status = [string]$d.healthStatus
-        if ($status -and $status -notin @('Healthy', 'OK', 'PASSED', 'Normal', 'Unknown')) {
+        $h = [string]$d.healthStatus
+        $s = [string]$d.Status
+
+        $statusToCheck = if (-not [string]::IsNullOrWhiteSpace($h)) { $h } else { $s }
+
+        if (Test-IsBlacklistedDiskStatus -Status $statusToCheck) {
             $globalSmart = 'WARN'
             break
         }
@@ -462,9 +569,13 @@ function Get-HealthStatusAndAlerts {
     }
 
     foreach ($d in $DiskHealth) {
-        $status = [string]$d.healthStatus
-        if ($status -and $status -notin @('Healthy', 'OK', 'PASSED', 'Normal', 'Unknown')) {
-            $alerts.Add("Disk health warning: $($d.model) / $status")
+        $h = [string]$d.healthStatus
+        $s = [string]$d.Status
+        $statusToCheck = if (-not [string]::IsNullOrWhiteSpace($h)) { $h } else { $s }
+
+        if (Test-IsBlacklistedDiskStatus -Status $statusToCheck) {
+            $model = if ($d.model) { $d.model } elseif ($d.Model) { $d.Model } else { 'Unknown' }
+            $alerts.Add("Disk health warning: $model / $statusToCheck")
         }
     }
 
@@ -472,12 +583,16 @@ function Get-HealthStatusAndAlerts {
         $alerts.Add('Antivirus not detected')
     }
 
-    if ([bool]$Backup.MacriumInstalled -and [bool]$Backup.ReflectImageStale) {
-        $alerts.Add('Reflect backup stale')
-    }
-
-    if ([bool]$Backup.HasleoInstalled -and [bool]$Backup.HasleoImageStale) {
-        $alerts.Add('Hasleo backup stale')
+    if (-not [bool]$Backup.BackupOverallOk) {
+        if ([string]$Backup.BackupLatestSource -eq 'Hasleo') {
+            $alerts.Add('Hasleo backup stale')
+        }
+        elseif ([string]$Backup.BackupLatestSource -eq 'Reflect') {
+            $alerts.Add('Reflect backup stale')
+        }
+        else {
+            $alerts.Add('Reflect backup stale')
+        }
     }
 
     if ($alerts.Count -gt 0) {
@@ -588,7 +703,7 @@ try {
         pcLocation               = ''
         pcUser                   = $env:USERNAME
         device                   = $env:COMPUTERNAME
-        scriptVersion            = 'virgo-health-v4-logmask-1.3'
+        scriptVersion            = 'virgo-health-v4-logmask-1.4'
         antivirusVendor          = [string]$antivirus.AntivirusVendor
         antivirusProducts        = [string]$antivirus.AntivirusProducts
         antivirusDetected        = [bool]$antivirus.AntivirusDetected
