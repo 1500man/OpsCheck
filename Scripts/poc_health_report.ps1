@@ -1,4 +1,4 @@
-﻿?#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 Virgo Standard / Lite - poc_health_report.ps1
 ASCII-safe edition for Windows PowerShell 5.1
@@ -14,6 +14,8 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 $BaseDir    = 'C:\OpsCheck'
 $ConfigPath = Join-Path $BaseDir 'config.dpapi'
 $LogPath    = Join-Path $BaseDir 'poc_health_report.log'
+$ScriptVersion = 'virgo-health-v5-deviceid-smart-1.5.0'
+$ReleaseRevision = 20261023
 
 function Get-NowText {
     return (Get-Date).ToString('yyyy/MM/dd HH:mm:ss')
@@ -51,6 +53,8 @@ function Initialize-Log {
             '============================================================'
             "$(Get-NowText) [INFO ] poc_health_report.ps1 start"
             "BaseDir: $BaseDir"
+            "ScriptVersion: $ScriptVersion"
+            "ReleaseRevision: $ReleaseRevision"
             '============================================================'
         )
         Add-Content -LiteralPath $LogPath -Value $header -Encoding UTF8
@@ -72,6 +76,32 @@ function Write-LogLine {
 }
 
 function Write-Info { param([string]$Message) Write-LogLine -Level 'INFO' -Message $Message }
+
+
+function Get-OptionalPropertyValue {
+    param(
+        [Parameter(Mandatory = $true)]$Object,
+        [Parameter(Mandatory = $true)][string[]]$Names,
+        [string]$Default = ''
+    )
+
+    foreach ($name in $Names) {
+        try {
+            $prop = $Object.PSObject.Properties[$name]
+            if ($null -ne $prop) {
+                if ($null -ne $prop.Value) {
+                    return [string]$prop.Value
+                }
+                return $Default
+            }
+        }
+        catch {
+        }
+    }
+
+    return $Default
+}
+
 function Write-Ok   { param([string]$Message) Write-LogLine -Level 'OK'   -Message $Message }
 function Write-Warn { param([string]$Message) Write-LogLine -Level 'WARN' -Message $Message }
 function Write-Err  { param([string]$Message) Write-LogLine -Level 'ERROR' -Message $Message }
@@ -119,6 +149,40 @@ function Load-VirgoConfig {
     if (-not $obj.secret)   { throw 'secret missing in config.dpapi' }
 
     return $obj
+}
+
+function Get-EffectiveDeviceIdentity {
+    param([Parameter(Mandatory = $true)]$Config)
+
+    $hardwareUuid = ''
+    try {
+        $hardwareUuid = Get-DeviceUuid
+    }
+    catch {
+        if (($Config.PSObject.Properties.Name -contains 'hardwareUuid') -and
+            -not [string]::IsNullOrWhiteSpace([string]$Config.hardwareUuid)) {
+            $hardwareUuid = ([string]$Config.hardwareUuid).Trim()
+            Write-Warn '現在のSMBIOS UUID取得に失敗したため、config.dpapi保存値を使用します。'
+        }
+        else {
+            throw
+        }
+    }
+
+    $deviceId = $hardwareUuid
+    $mode = 'legacy-hardware-uuid'
+
+    if (($Config.PSObject.Properties.Name -contains 'deviceId') -and
+        -not [string]::IsNullOrWhiteSpace([string]$Config.deviceId)) {
+        $deviceId = ([string]$Config.deviceId).Trim()
+        $mode = if ($deviceId -eq $hardwareUuid) { 'hardware-uuid' } else { 'virgo-device-id' }
+    }
+
+    return [PSCustomObject]@{
+        DeviceId     = $deviceId
+        HardwareUuid = $hardwareUuid
+        Mode         = $mode
+    }
 }
 
 function Get-EffectiveEndpoint {
@@ -247,14 +311,117 @@ function Get-VolumeInfo {
     return @($volumes)
 }
 
+function Parse-SmartctlDeviceBlock {
+    param(
+        [Parameter(Mandatory = $true)][string]$Text
+    )
+
+    $model = ''
+    $status = '不明'
+    $temp = '不明'
+    $hours = '不明'
+
+    $m = [regex]::Match($Text, '(?m)^Device Model:\s*(.+)$')
+    if (-not $m.Success) { $m = [regex]::Match($Text, '(?m)^Model Number:\s*(.+)$') }
+    if (-not $m.Success) { $m = [regex]::Match($Text, '(?m)^Model Family:\s*(.+)$') }
+    if (-not $m.Success) { $m = [regex]::Match($Text, '(?m)^Product:\s*(.+)$') }
+    if ($m.Success) { $model = $m.Groups[1].Value.Trim() }
+
+    $m = [regex]::Match($Text, '(?m)^SMART overall-health self-assessment test result:\s*(.+)$')
+    if ($m.Success) {
+        $status = $m.Groups[1].Value.Trim()
+    }
+    else {
+        $m = [regex]::Match($Text, '(?m)^SMART Health Status:\s*(.+)$')
+        if ($m.Success) { $status = $m.Groups[1].Value.Trim() }
+    }
+
+    $m = [regex]::Match($Text, '(?m)^Temperature:\s*(\d+)')
+    if ($m.Success) {
+        $temp = $m.Groups[1].Value.Trim()
+    }
+    else {
+        $m = [regex]::Match($Text, '(?m)^(194|190)\s+\S+.*?\s+(\d+)\s*$')
+        if ($m.Success) { $temp = $m.Groups[2].Value.Trim() }
+    }
+
+    $m = [regex]::Match($Text, '(?m)^Power On Hours:\s*([0-9,]+)')
+    if ($m.Success) {
+        $hours = $m.Groups[1].Value.Replace(',', '').Trim()
+    }
+    else {
+        $m = [regex]::Match($Text, '(?m)^9\s+\S+.*?\s+(\d+)\s*$')
+        if (-not $m.Success) { $m = [regex]::Match($Text, '(?m)^Power_On_Hours.*?(\d+)\s*$') }
+        if ($m.Success) { $hours = $m.Groups[$m.Groups.Count - 1].Value.Trim() }
+    }
+
+    return [PSCustomObject]@{
+        model             = if ($model) { $model } else { 'Unknown' }
+        mediaType         = 'Unknown'
+        healthStatus      = if ($status) { $status } else { '不明' }
+        operationalStatus = 'OK'
+        temperature       = if ($temp) { $temp } else { '不明' }
+        powerOnHours      = if ($hours) { $hours } else { '不明' }
+    }
+}
+
+function Get-SmartctlDiskHealthInfo {
+    $smartctl = Join-Path $BaseDir 'smartmontools\bin\smartctl.exe'
+    $result = @()
+
+    if (-not (Test-Path -LiteralPath $smartctl)) {
+        Write-Warn ("smartctl not found: {0}" -f $smartctl)
+        return @()
+    }
+
+    Write-Info ("smartctl found: {0}" -f $smartctl)
+
+    try {
+        $scan = & $smartctl --scan 2>$null
+        if (-not $scan) {
+            Write-Warn 'smartctl --scan returned no devices.'
+            return @()
+        }
+
+        foreach ($line in $scan) {
+            $scanLine = [string]$line
+            if ([string]::IsNullOrWhiteSpace($scanLine)) { continue }
+
+            $parts = @($scanLine -split '\s+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if ($parts.Count -lt 1) { continue }
+
+            $devicePath = [string]$parts[0]
+            $args = @('-a', $devicePath)
+            $dIndex = [Array]::IndexOf($parts, '-d')
+            if ($dIndex -ge 0 -and ($dIndex + 1) -lt $parts.Count) {
+                $args += @('-d', [string]$parts[$dIndex + 1])
+            }
+
+            try {
+                $text = (& $smartctl @args 2>$null) -join [Environment]::NewLine
+                if ([string]::IsNullOrWhiteSpace($text)) { continue }
+                $result += Parse-SmartctlDeviceBlock -Text $text
+            }
+            catch {
+                Write-Warn ("smartctl parse failed for {0}: {1}" -f $devicePath, $_.Exception.Message)
+            }
+        }
+    }
+    catch {
+        Write-Warn ("smartctl scan failed: {0}" -f $_.Exception.Message)
+    }
+
+    return @($result)
+}
+
 function Get-DiskHealthInfo {
-    $disks = @()
+    $physical = @()
 
     try {
         $physicalDisks = Get-PhysicalDisk -ErrorAction Stop
         foreach ($d in $physicalDisks) {
             $health = [string]$d.HealthStatus
-            $disks += [PSCustomObject]@{
+            $physical += [PSCustomObject]@{
                 model             = [string]$d.FriendlyName
                 mediaType         = [string]$d.MediaType
                 healthStatus      = $health
@@ -263,18 +430,18 @@ function Get-DiskHealthInfo {
                 powerOnHours      = ''
             }
         }
-    } catch {
+    }
+    catch {
         Write-Warn ("Get-PhysicalDisk failed: {0}" -f $_.Exception.Message)
     }
 
-    $smartctl = Join-Path $BaseDir 'smartmontools\bin\smartctl.exe'
-    if (Test-Path -LiteralPath $smartctl) {
-        Write-Info ("smartctl found: {0}" -f $smartctl)
-    } else {
-        Write-Warn ("smartctl not found: {0}" -f $smartctl)
+    $smart = @(Get-SmartctlDiskHealthInfo)
+    if ($smart.Count -gt 0) {
+        # 以前のSMART詳細取得を復旧。smartctlが取得できた場合はその詳細を優先する。
+        return @($smart)
     }
 
-    return @($disks)
+    return @($physical)
 }
 
 function Get-RecentFileDate {
@@ -339,9 +506,9 @@ function Test-IsBlacklistedDiskStatus {
 
 function Get-LatestBackupCandidate {
     param(
-        [Parameter(Mandatory = $true)][string]$ReflectLatest,
+        [AllowNull()][AllowEmptyString()][string]$ReflectLatest,
         [Parameter(Mandatory = $true)][bool]$ReflectInstalled,
-        [Parameter(Mandatory = $true)][string]$HasleoLatest,
+        [AllowNull()][AllowEmptyString()][string]$HasleoLatest,
         [Parameter(Mandatory = $true)][bool]$HasleoInstalled
     )
 
@@ -533,8 +700,8 @@ function Apply-SmartStatusToVolumes {
     $globalSmart = 'OK'
 
     foreach ($d in $DiskHealth) {
-        $h = [string]$d.healthStatus
-        $s = [string]$d.Status
+        $h = Get-OptionalPropertyValue -Object $d -Names @('healthStatus', 'HealthStatus') -Default ''
+        $s = Get-OptionalPropertyValue -Object $d -Names @('Status', 'status', 'operationalStatus', 'OperationalStatus') -Default ''
 
         $statusToCheck = if (-not [string]::IsNullOrWhiteSpace($h)) { $h } else { $s }
 
@@ -569,12 +736,12 @@ function Get-HealthStatusAndAlerts {
     }
 
     foreach ($d in $DiskHealth) {
-        $h = [string]$d.healthStatus
-        $s = [string]$d.Status
+        $h = Get-OptionalPropertyValue -Object $d -Names @('healthStatus', 'HealthStatus') -Default ''
+        $s = Get-OptionalPropertyValue -Object $d -Names @('Status', 'status', 'operationalStatus', 'OperationalStatus') -Default ''
         $statusToCheck = if (-not [string]::IsNullOrWhiteSpace($h)) { $h } else { $s }
 
         if (Test-IsBlacklistedDiskStatus -Status $statusToCheck) {
-            $model = if ($d.model) { $d.model } elseif ($d.Model) { $d.Model } else { 'Unknown' }
+            $model = Get-OptionalPropertyValue -Object $d -Names @('model', 'Model', 'FriendlyName') -Default 'Unknown'
             $alerts.Add("Disk health warning: $model / $statusToCheck")
         }
     }
@@ -679,12 +846,16 @@ try {
     Write-Info ("Checking config.dpapi: {0}" -f $ConfigPath)
     $config = Load-VirgoConfig
     $endpoint = Get-EffectiveEndpoint -Config $config
-    $uuid = Get-DeviceUuid
+    $identity = Get-EffectiveDeviceIdentity -Config $config
+    $deviceId = [string]$identity.DeviceId
+    $hardwareUuid = [string]$identity.HardwareUuid
     $customerGroup = Get-CustomerGroup
 
     Write-Ok 'config.dpapi decrypted successfully.'
     Write-Info 'Endpoint resolved'
-    Write-Info ("UUID: {0}" -f $uuid)
+    Write-Info ("DeviceId: {0}" -f $deviceId)
+    Write-Info ("HardwareUUID: {0}" -f $hardwareUuid)
+    Write-Info ("IdentityMode: {0}" -f $identity.Mode)
     Write-Info ("CustomerGroup: {0}" -f $customerGroup)
 
     $antivirus = Get-AntivirusInfo
@@ -703,7 +874,7 @@ try {
         pcLocation               = ''
         pcUser                   = $env:USERNAME
         device                   = $env:COMPUTERNAME
-        scriptVersion            = 'virgo-health-v4-logmask-1.4'
+        scriptVersion            = $ScriptVersion
         antivirusVendor          = [string]$antivirus.AntivirusVendor
         antivirusProducts        = [string]$antivirus.AntivirusProducts
         antivirusDetected        = [bool]$antivirus.AntivirusDetected
@@ -723,13 +894,14 @@ try {
         reflectImageStale        = [bool]$backup.ReflectImageStale
         healthStatus             = [string]$health.HealthStatus
         alerts                   = @($health.Alerts)
-        uuid                     = $uuid
+        uuid                     = $deviceId
+        hardwareUuid             = $hardwareUuid
         scriptHash               = 'LOCAL_TEST_UNSET_HASH'
     }
 
     Write-LogLine -Level 'DEBUG' -Message ("Inner Payload: " + (($payload | ConvertTo-Json -Compress -Depth 12)))
 
-    $res = Invoke-SignedPost -Endpoint $endpoint -Secret ([string]$config.secret) -Uuid $uuid -InnerPayload $payload
+    $res = Invoke-SignedPost -Endpoint $endpoint -Secret ([string]$config.secret) -Uuid $deviceId -InnerPayload $payload
 
     if ($res.StatusCode -eq 200 -and $res.Content -match '^ok') {
         Write-Ok 'Health report sent successfully.'

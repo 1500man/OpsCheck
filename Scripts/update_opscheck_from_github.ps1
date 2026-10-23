@@ -1,13 +1,14 @@
+ï»¿
 #requires -Version 5.1
 <#
 Virgo Standard/Lite - update_opscheck_from_github.ps1
 
-–Ú“I:
-- GitHub Release(latest) ‚©‚çÅVƒXƒNƒŠƒvƒg‚ğæ“¾
-- poc_health_report.ps1 ‚ğˆÀ‘S‚ÉXV
-- update_opscheck_from_github.ps1 ©g‚Í .pending ‚É•Û‘¶‚µ‚ÄŸ‰ñ‹N“®‚É¸Ši
-- XVŒ‹‰Ê‚ğ GAS ‚É updateLog ‚Æ‚µ‚Ä‘—M
-- ƒƒO“à‚Ì URL ‚Í©“®ƒ}ƒXƒN
+ç›®çš„:
+- GitHub Release(latest) ã‹ã‚‰æœ€æ–°ã‚¹ã‚¯ãƒªãƒ—ãƒˆã‚’å–å¾—
+- poc_health_report.ps1 ã‚’å®‰å…¨ã«æ›´æ–°
+- update_opscheck_from_github.ps1 è‡ªèº«ã¯ .pending ã«ä¿å­˜ã—ã¦æ¬¡å›èµ·å‹•æ™‚ã«æ˜‡æ ¼
+- æ›´æ–°çµæœã‚’ GAS ã« updateLog ã¨ã—ã¦é€ä¿¡
+- ãƒ­ã‚°å†…ã® URL ã¯è‡ªå‹•ãƒã‚¹ã‚¯
 #>
 
 Set-StrictMode -Version Latest
@@ -24,11 +25,12 @@ $HealthPath     = Join-Path $BaseDir 'poc_health_report.ps1'
 $UpdaterPath    = Join-Path $BaseDir 'update_opscheck_from_github.ps1'
 $PendingPath    = Join-Path $BaseDir 'update_opscheck_from_github.ps1.pending'
 
-# Release ”z•zURL
-$HealthReleaseUrl  = 'https://github.com/1500man/Virgo-Release/releases/latest/download/poc_health_report.ps1'
-$UpdaterReleaseUrl = 'https://github.com/1500man/Virgo-Release/releases/latest/download/update_opscheck_from_github.ps1'
+# Release é…å¸ƒURL
+$HealthReleaseUrl  = 'https://github.com/1500man/OpsCheck/releases/latest/download/poc_health_report.ps1'
+$UpdaterReleaseUrl = 'https://github.com/1500man/OpsCheck/releases/latest/download/update_opscheck_from_github.ps1'
 
-$UpdaterVersion = 'virgo-updater-v6.0.0'
+$UpdaterVersion = 'virgo-updater-v7.2.1-deviceid-nodowngrade'
+$ReleaseRevision = 20261023
 
 function Get-NowText {
     return (Get-Date).ToString('yyyy/MM/dd HH:mm:ss')
@@ -67,9 +69,10 @@ function Initialize-Log {
         $header = @(
             ''
             '============================================================'
-            "$(Get-NowText) [INFO ] update_opscheck_from_github.ps1 ÀsŠJn"
+            "$(Get-NowText) [INFO ] update_opscheck_from_github.ps1 å®Ÿè¡Œé–‹å§‹"
             "BaseDir: $BaseDir"
             "UpdaterVersion: $UpdaterVersion"
+            "ReleaseRevision: $ReleaseRevision"
             '============================================================'
         )
         Add-Content -LiteralPath $LogPath -Value $header -Encoding UTF8
@@ -111,7 +114,7 @@ function Write-Err {
 
 function Load-VirgoConfig {
     if (-not (Test-Path -LiteralPath $ConfigPath)) {
-        throw "config.dpapi ‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñ: $ConfigPath"
+        throw "config.dpapi ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“: $ConfigPath"
     }
 
     Add-Type -AssemblyName System.Security
@@ -127,8 +130,8 @@ function Load-VirgoConfig {
     Write-LogLine -Level 'DEBUG' -Message 'config loaded'
 
     $obj = $json | ConvertFrom-Json -ErrorAction Stop
-    if (-not $obj.endpoint) { throw 'config.dpapi ‚É endpoint ‚ª‚ ‚è‚Ü‚¹‚ñB' }
-    if (-not $obj.secret)   { throw 'config.dpapi ‚É secret ‚ª‚ ‚è‚Ü‚¹‚ñB' }
+    if (-not $obj.endpoint) { throw 'config.dpapi ã« endpoint ãŒã‚ã‚Šã¾ã›ã‚“ã€‚' }
+    if (-not $obj.secret)   { throw 'config.dpapi ã« secret ãŒã‚ã‚Šã¾ã›ã‚“ã€‚' }
 
     return $obj
 }
@@ -138,11 +141,11 @@ function Get-EffectiveEndpoint {
 
     $envEndpoint = [Environment]::GetEnvironmentVariable('VIRGO_ENDPOINT', 'Machine')
     if (-not [string]::IsNullOrWhiteSpace($envEndpoint)) {
-        Write-Info 'MachineŠÂ‹«•Ï” VIRGO_ENDPOINT ‚ğg—p‚µ‚Ü‚·B'
+        Write-Info 'Machineç’°å¢ƒå¤‰æ•° VIRGO_ENDPOINT ã‚’ä½¿ç”¨ã—ã¾ã™ã€‚'
         return $envEndpoint.Trim()
     }
 
-    Write-Warn 'MachineŠÂ‹«•Ï” VIRGO_ENDPOINT ‚ª‹ó‚Ì‚½‚ßAconfig.dpapi ‚Ì endpoint ‚ğg—p‚µ‚Ü‚·B'
+    Write-Warn 'Machineç’°å¢ƒå¤‰æ•° VIRGO_ENDPOINT ãŒç©ºã®ãŸã‚ã€config.dpapi ã® endpoint ã‚’ä½¿ç”¨ã—ã¾ã™ã€‚'
     return ([string]$Config.endpoint).Trim()
 }
 
@@ -173,7 +176,7 @@ function Get-DeviceUuid {
         Write-Warn "Get-WmiObject UUID failed: $($_.Exception.Message)"
     }
 
-    throw 'UUID ‚Ìæ“¾‚É¸”s‚µ‚Ü‚µ‚½B'
+    throw 'UUID ã®å–å¾—ã«å¤±æ•—ã—ã¾ã—ãŸã€‚'
 }
 
 function Get-FileSha256 {
@@ -186,7 +189,7 @@ function Get-FileSha256 {
     try {
         return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
     } catch {
-        Write-Warn "Hashæ“¾¸”s: $Path / $($_.Exception.Message)"
+        Write-Warn "Hashå–å¾—å¤±æ•—: $Path / $($_.Exception.Message)"
         return ''
     }
 }
@@ -206,9 +209,43 @@ function Test-DownloadedScriptIsHtml {
         }
         return $false
     } catch {
-        Write-Warn "HTMLŒŸ¸¸”s: $Path / $($_.Exception.Message)"
+        Write-Warn "HTMLæ¤œæŸ»å¤±æ•—: $Path / $($_.Exception.Message)"
         return $true
     }
+}
+
+function Get-ReleaseRevisionFromFile {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { return 0 }
+
+    try {
+        $text = [System.IO.File]::ReadAllText($Path)
+        $m = [regex]::Match($text, '(?m)^\s*\$ReleaseRevision\s*=\s*(\d+)\s*$')
+        if ($m.Success) { return [int64]$m.Groups[1].Value }
+    }
+    catch {
+        Write-Warn ("ReleaseRevision read failed: {0}" -f $_.Exception.Message)
+    }
+
+    return 0
+}
+
+function Test-CandidateIsDowngrade {
+    param(
+        [Parameter(Mandatory = $true)][string]$CurrentPath,
+        [Parameter(Mandatory = $true)][string]$CandidatePath
+    )
+
+    $currentRevision = Get-ReleaseRevisionFromFile -Path $CurrentPath
+    $candidateRevision = Get-ReleaseRevisionFromFile -Path $CandidatePath
+
+    if ($currentRevision -gt 0 -and $candidateRevision -lt $currentRevision) {
+        Write-Warn ("ãƒ€ã‚¦ãƒ³ã‚°ãƒ¬ãƒ¼ãƒ‰ã‚’æ‹’å¦ã—ã¾ã—ãŸã€‚CurrentRevision={0}, CandidateRevision={1}" -f $currentRevision, $candidateRevision)
+        return $true
+    }
+
+    return $false
 }
 
 function Download-ReleaseAsset {
@@ -217,20 +254,20 @@ function Download-ReleaseAsset {
         [Parameter(Mandatory = $true)][string]$DestinationTemp
     )
 
-    Write-Info "ƒ_ƒEƒ“ƒ[ƒhŠJn: $Url"
+    Write-Info "ãƒ€ã‚¦ãƒ³ãƒ­ãƒ¼ãƒ‰é–‹å§‹: $Url"
 
     Invoke-WebRequest -Uri $Url -OutFile $DestinationTemp -UseBasicParsing -ErrorAction Stop
 
     if (-not (Test-Path -LiteralPath $DestinationTemp)) {
-        throw "ƒ_ƒEƒ“ƒ[ƒhƒtƒ@ƒCƒ‹‚ª‘¶İ‚µ‚Ü‚¹‚ñ: $DestinationTemp"
+        throw "ãƒ€ã‚¦ãƒ³ãƒ­ãƒ¼ãƒ‰ãƒ•ã‚¡ã‚¤ãƒ«ãŒå­˜åœ¨ã—ã¾ã›ã‚“: $DestinationTemp"
     }
 
     if (Test-DownloadedScriptIsHtml -Path $DestinationTemp) {
         Remove-Item -LiteralPath $DestinationTemp -Force -ErrorAction SilentlyContinue
-        throw "ƒ_ƒEƒ“ƒ[ƒhŒ‹‰Ê‚ª HTML ‚Å‚µ‚½BRelease asset URL ‚Ü‚½‚ÍŒöŠJó‘Ô‚ğŠm”F‚µ‚Ä‚­‚¾‚³‚¢B"
+        throw "ãƒ€ã‚¦ãƒ³ãƒ­ãƒ¼ãƒ‰çµæœãŒ HTML ã§ã—ãŸã€‚Release asset URL ã¾ãŸã¯å…¬é–‹çŠ¶æ…‹ã‚’ç¢ºèªã—ã¦ãã ã•ã„ã€‚"
     }
 
-    Write-Ok "ƒ_ƒEƒ“ƒ[ƒh¬Œ÷: $DestinationTemp"
+    Write-Ok "ãƒ€ã‚¦ãƒ³ãƒ­ãƒ¼ãƒ‰æˆåŠŸ: $DestinationTemp"
 }
 
 function Promote-PendingUpdaterIfExists {
@@ -238,20 +275,26 @@ function Promote-PendingUpdaterIfExists {
         return
     }
 
-    Write-Info ".pending ‚Ì¸Šiˆ—‚ğŠJn‚µ‚Ü‚·B"
+    Write-Info ".pending ã®æ˜‡æ ¼å‡¦ç†ã‚’é–‹å§‹ã—ã¾ã™ã€‚"
 
     if (Test-DownloadedScriptIsHtml -Path $PendingPath) {
-        Write-Warn ".pending ‚ª HTML ‚¾‚Á‚½‚½‚ß”jŠü‚µ‚Ü‚·B"
+        Write-Warn ".pending ãŒ HTML ã ã£ãŸãŸã‚ç ´æ£„ã—ã¾ã™ã€‚"
         Remove-Item -LiteralPath $PendingPath -Force -ErrorAction SilentlyContinue
         return
     }
 
     try {
+        if (Test-CandidateIsDowngrade -CurrentPath $UpdaterPath -CandidatePath $PendingPath) {
+            Write-Warn '.pending ã¯ç¾åœ¨ã®updaterã‚ˆã‚Šå¤ã„ãŸã‚ç ´æ£„ã—ã¾ã—ãŸã€‚'
+            Remove-Item -LiteralPath $PendingPath -Force -ErrorAction SilentlyContinue
+            return
+        }
+
         Copy-Item -LiteralPath $PendingPath -Destination $UpdaterPath -Force
         Remove-Item -LiteralPath $PendingPath -Force -ErrorAction SilentlyContinue
-        Write-Ok 'updater ©g‚ğ .pending ‚©‚ç¸Ši‚µ‚Ü‚µ‚½B'
+        Write-Ok 'updater è‡ªèº«ã‚’ .pending ã‹ã‚‰æ˜‡æ ¼ã—ã¾ã—ãŸã€‚'
     } catch {
-        Write-Warn "updater ¸Ši‚É¸”s‚µ‚Ü‚µ‚½: $($_.Exception.Message)"
+        Write-Warn "updater æ˜‡æ ¼ã«å¤±æ•—ã—ã¾ã—ãŸ: $($_.Exception.Message)"
     }
 }
 
@@ -261,6 +304,40 @@ function New-Nonce {
 
 function New-UnixTime {
     return [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+}
+
+function Get-EffectiveDeviceIdentity {
+    param([Parameter(Mandatory = $true)]$Config)
+
+    $hardwareUuid = ''
+    try {
+        $hardwareUuid = Get-DeviceUuid
+    }
+    catch {
+        if (($Config.PSObject.Properties.Name -contains 'hardwareUuid') -and
+            -not [string]::IsNullOrWhiteSpace([string]$Config.hardwareUuid)) {
+            $hardwareUuid = ([string]$Config.hardwareUuid).Trim()
+            Write-Warn 'ç¾åœ¨ã®SMBIOS UUIDå–å¾—ã«å¤±æ•—ã—ãŸãŸã‚ã€config.dpapiä¿å­˜å€¤ã‚’ä½¿ç”¨ã—ã¾ã™ã€‚'
+        }
+        else {
+            throw
+        }
+    }
+
+    $deviceId = $hardwareUuid
+    $mode = 'legacy-hardware-uuid'
+
+    if (($Config.PSObject.Properties.Name -contains 'deviceId') -and
+        -not [string]::IsNullOrWhiteSpace([string]$Config.deviceId)) {
+        $deviceId = ([string]$Config.deviceId).Trim()
+        $mode = if ($deviceId -eq $hardwareUuid) { 'hardware-uuid' } else { 'virgo-device-id' }
+    }
+
+    return [PSCustomObject]@{
+        DeviceId     = $deviceId
+        HardwareUuid = $hardwareUuid
+        Mode         = $mode
+    }
 }
 
 function ConvertTo-Base64Json {
@@ -342,17 +419,21 @@ try {
 
     $config = Load-VirgoConfig
     $endpoint = Get-EffectiveEndpoint -Config $config
-    $uuid = Get-DeviceUuid
+    $identity = Get-EffectiveDeviceIdentity -Config $config
+    $deviceId = [string]$identity.DeviceId
+    $hardwareUuid = [string]$identity.HardwareUuid
     $customerGroup = Get-CustomerGroup
 
     Write-Info "UpdaterVersion: $UpdaterVersion"
-    Write-Info "UUID: $uuid"
+    Write-Info "DeviceId: $deviceId"
+    Write-Info "HardwareUUID: $hardwareUuid"
+    Write-Info "IdentityMode: $($identity.Mode)"
     Write-Info "CustomerGroup: $customerGroup"
 
     $tmpHealth  = Join-Path $env:TEMP ('virgo_health_'  + [guid]::NewGuid().ToString('N') + '.tmp')
     $tmpUpdater = Join-Path $env:TEMP ('virgo_updater_' + [guid]::NewGuid().ToString('N') + '.tmp')
 
-    # 1) health script XV
+    # 1) health script æ›´æ–°
     try {
         Download-ReleaseAsset -Url $HealthReleaseUrl -DestinationTemp $tmpHealth
 
@@ -360,16 +441,18 @@ try {
         $oldHash = Get-FileSha256 -Path $HealthPath
 
         if ($newHash -and $oldHash -and $newHash -eq $oldHash) {
-            Write-Info 'poc_health_report.ps1 ‚ÍÅV‚Å‚·B'
+            Write-Info 'poc_health_report.ps1 ã¯æœ€æ–°ã§ã™ã€‚'
+        } elseif (Test-CandidateIsDowngrade -CurrentPath $HealthPath -CandidatePath $tmpHealth) {
+            Write-Warn 'poc_health_report.ps1 ã¯ç¾åœ¨ã®ãƒ­ãƒ¼ã‚«ãƒ«ç‰ˆã®æ–¹ãŒæ–°ã—ã„ãŸã‚ã€Releaseã«ã‚ˆã‚‹å…ˆç¥–è¿”ã‚Šã‚’é˜²æ­¢ã—ã¾ã—ãŸã€‚'
         } else {
             Copy-Item -LiteralPath $tmpHealth -Destination $HealthPath -Force
-            Write-Ok 'poc_health_report.ps1 ‚ğXV‚µ‚Ü‚µ‚½B'
+            Write-Ok 'poc_health_report.ps1 ã‚’æ›´æ–°ã—ã¾ã—ãŸã€‚'
         }
 
         $successFiles.Add('poc_health_report.ps1') | Out-Null
     }
     catch {
-        $msg = "poc_health_report.ps1 XV¸”s: $($_.Exception.Message)"
+        $msg = "poc_health_report.ps1 æ›´æ–°å¤±æ•—: $($_.Exception.Message)"
         Write-Err $msg
         $failedFiles.Add('poc_health_report.ps1') | Out-Null
         $errorDetails.Add($msg) | Out-Null
@@ -378,7 +461,7 @@ try {
         Remove-Item -LiteralPath $tmpHealth -Force -ErrorAction SilentlyContinue
     }
 
-    # 2) updater ©g‚ÌXV
+    # 2) updater è‡ªèº«ã®æ›´æ–°
     try {
         Download-ReleaseAsset -Url $UpdaterReleaseUrl -DestinationTemp $tmpUpdater
 
@@ -386,16 +469,18 @@ try {
         $oldHash = Get-FileSha256 -Path $UpdaterPath
 
         if ($newHash -and $oldHash -and $newHash -eq $oldHash) {
-            Write-Info 'update_opscheck_from_github.ps1 ‚ÍÅV‚Å‚·B'
+            Write-Info 'update_opscheck_from_github.ps1 ã¯æœ€æ–°ã§ã™ã€‚'
+        } elseif (Test-CandidateIsDowngrade -CurrentPath $UpdaterPath -CandidatePath $tmpUpdater) {
+            Write-Warn 'update_opscheck_from_github.ps1 ã¯ç¾åœ¨ã®ãƒ­ãƒ¼ã‚«ãƒ«ç‰ˆã®æ–¹ãŒæ–°ã—ã„ãŸã‚ã€Releaseã«ã‚ˆã‚‹å…ˆç¥–è¿”ã‚Šã‚’é˜²æ­¢ã—ã¾ã—ãŸã€‚'
         } else {
             Copy-Item -LiteralPath $tmpUpdater -Destination $PendingPath -Force
-            Write-Ok 'updater ©g‚ÌVƒo[ƒWƒ‡ƒ“‚ğ .pending ‚É•Û‘¶‚µ‚Ü‚µ‚½B'
+            Write-Ok 'updater è‡ªèº«ã®æ–°ãƒãƒ¼ã‚¸ãƒ§ãƒ³ã‚’ .pending ã«ä¿å­˜ã—ã¾ã—ãŸã€‚'
         }
 
         $successFiles.Add('update_opscheck_from_github.ps1') | Out-Null
     }
     catch {
-        $msg = "update_opscheck_from_github.ps1 XV¸”s: $($_.Exception.Message)"
+        $msg = "update_opscheck_from_github.ps1 æ›´æ–°å¤±æ•—: $($_.Exception.Message)"
         Write-Err $msg
         $failedFiles.Add('update_opscheck_from_github.ps1') | Out-Null
         $errorDetails.Add($msg) | Out-Null
@@ -406,18 +491,26 @@ try {
 
     $message =
         if ($failedFiles.Count -eq 0) {
-            'XVˆ—Š®—¹: ‚·‚×‚Ä¬Œ÷'
+            'æ›´æ–°å‡¦ç†å®Œäº†: ã™ã¹ã¦æˆåŠŸ'
         } elseif ($successFiles.Count -gt 0) {
-            'XVˆ—Š®—¹: ˆê•”¬Œ÷'
+            'æ›´æ–°å‡¦ç†å®Œäº†: ä¸€éƒ¨æˆåŠŸ'
         } else {
-            'XVˆ—¸”s: ‚·‚×‚Ä¸”s'
+            'æ›´æ–°å‡¦ç†å¤±æ•—: ã™ã¹ã¦å¤±æ•—'
         }
+
+    $filesText = (@($successFiles.ToArray()) -join ', ')
+    $failuresText = (@($failedFiles.ToArray()) -join ', ')
+    if ($errorDetails.Count -gt 0) {
+        if (-not [string]::IsNullOrWhiteSpace($failuresText)) { $failuresText += ' | ' }
+        $failuresText += ($errorDetails -join ' | ')
+    }
 
     $updateLogPayload = @{
         action        = 'updateLog'
         device        = $env:COMPUTERNAME
         customerGroup = $customerGroup
-        uuid          = $uuid
+        uuid          = $deviceId
+        hardwareUuid  = $hardwareUuid
         timestamp     = (Get-Date).ToString('yyyy/MM/dd HH:mm:ss')
         updaterVer    = $UpdaterVersion
         message       = $message
@@ -426,18 +519,20 @@ try {
         failedCount   = $failedFiles.Count
         failedFiles   = @($failedFiles.ToArray())
         errors        = ($errorDetails -join ' | ')
+        files         = $filesText
+        failures      = $failuresText
     }
 
     try {
-        $res = Send-UpdateLogToGas -Endpoint $endpoint -Secret ([string]$config.secret) -Uuid $uuid -InnerPayload $updateLogPayload
+        $res = Send-UpdateLogToGas -Endpoint $endpoint -Secret ([string]$config.secret) -Uuid $deviceId -InnerPayload $updateLogPayload
         if ($res.StatusCode -eq 200 -and $res.Content -match '^ok') {
-            Write-Ok 'updateLog ‚Ì‘—M‚É¬Œ÷‚µ‚Ü‚µ‚½B'
+            Write-Ok 'updateLog ã®é€ä¿¡ã«æˆåŠŸã—ã¾ã—ãŸã€‚'
         } else {
-            Write-Warn "updateLog ‰“š‚ª‘z’èŠO‚Å‚·: $($res.Content)"
+            Write-Warn "updateLog å¿œç­”ãŒæƒ³å®šå¤–ã§ã™: $($res.Content)"
         }
     }
     catch {
-        Write-Warn "updateLog ‘—M¸”s: $($_.Exception.Message)"
+        Write-Warn "updateLog é€ä¿¡å¤±æ•—: $($_.Exception.Message)"
     }
 }
 catch {
