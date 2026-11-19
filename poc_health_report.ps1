@@ -14,8 +14,8 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 $BaseDir    = 'C:\OpsCheck'
 $ConfigPath = Join-Path $BaseDir 'config.dpapi'
 $LogPath    = Join-Path $BaseDir 'poc_health_report.log'
-$ScriptVersion = 'virgo-health-v5-deviceid-smart-1.5.0'
-$ReleaseRevision = 20261023
+$ScriptVersion = 'virgo-health-v5-deviceid-smart-1.5.1'
+$ReleaseRevision = 20261119
 
 function Get-NowText {
     return (Get-Date).ToString('yyyy/MM/dd HH:mm:ss')
@@ -341,7 +341,7 @@ function Parse-SmartctlDeviceBlock {
         $temp = $m.Groups[1].Value.Trim()
     }
     else {
-        $m = [regex]::Match($Text, '(?m)^(194|190)\s+\S+.*?\s+(\d+)\s*$')
+        $m = [regex]::Match($Text, '(?m)^[ \t]*(194|190)\s+\S+.*?\s+(\d+)\s*$')
         if ($m.Success) { $temp = $m.Groups[2].Value.Trim() }
     }
 
@@ -350,7 +350,7 @@ function Parse-SmartctlDeviceBlock {
         $hours = $m.Groups[1].Value.Replace(',', '').Trim()
     }
     else {
-        $m = [regex]::Match($Text, '(?m)^9\s+\S+.*?\s+(\d+)\s*$')
+        $m = [regex]::Match($Text, '(?m)^[ \t]*9\s+\S+.*?\s+(\d+)\s*$')
         if (-not $m.Success) { $m = [regex]::Match($Text, '(?m)^Power_On_Hours.*?(\d+)\s*$') }
         if ($m.Success) { $hours = $m.Groups[$m.Groups.Count - 1].Value.Trim() }
     }
@@ -547,7 +547,7 @@ function Get-LatestBackupCandidate {
 
 function Get-BackupInfo {
     param(
-        [Parameter(Mandatory = $true)][array]$Volumes
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Volumes
     )
 
     $result = [ordered]@{
@@ -605,7 +605,7 @@ function Get-BackupInfo {
             'C:\Backup'
         ) + $rootCandidates
 
-        $latestHasleo = Get-RecentFileDate -RootPaths $hasleoRoots -Patterns @('*.hbi', '*.adi', '*.pbd')
+        $latestHasleo = Get-RecentFileDate -RootPaths $hasleoRoots -Patterns @('*.dbi', '*.hbi', '*.adi', '*.pbd')
         if ($latestHasleo) {
             $result.HasleoLatestImage = ([datetime]$latestHasleo).ToString('yyyy/MM/dd HH:mm:ss')
             $result.HasleoImageStale = ((New-TimeSpan -Start ([datetime]$latestHasleo) -End (Get-Date)).TotalDays -gt 14)
@@ -658,7 +658,7 @@ function Get-BackupInfo {
         }
 
         if (-not $isBackup -and $result.HasleoInstalled) {
-            $hasHasleo = Get-ChildItem -Path $root -Include '*.hbi', '*.adi', '*.pbd' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            $hasHasleo = Get-ChildItem -Path $root -Include '*.dbi', '*.hbi', '*.adi', '*.pbd' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($hasHasleo) { $isBackup = $true }
         }
 
@@ -673,7 +673,7 @@ function Get-BackupInfo {
 
 function Apply-BackupFlagsToVolumes {
     param(
-        [Parameter(Mandatory = $true)][array]$Volumes,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Volumes,
         [Parameter(Mandatory = $true)]$BackupInfo
     )
 
@@ -693,11 +693,11 @@ function Apply-BackupFlagsToVolumes {
 
 function Apply-SmartStatusToVolumes {
     param(
-        [Parameter(Mandatory = $true)][array]$Volumes,
-        [Parameter(Mandatory = $true)][array]$DiskHealth
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Volumes,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$DiskHealth
     )
 
-    $globalSmart = 'OK'
+    $globalSmart = if ($DiskHealth.Count -eq 0) { 'WARN' } else { 'OK' }
 
     foreach ($d in $DiskHealth) {
         $h = Get-OptionalPropertyValue -Object $d -Names @('healthStatus', 'HealthStatus') -Default ''
@@ -720,14 +720,16 @@ function Apply-SmartStatusToVolumes {
 
 function Get-HealthStatusAndAlerts {
     param(
-        [Parameter(Mandatory = $true)]$Volumes,
-        [Parameter(Mandatory = $true)]$DiskHealth,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Volumes,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$DiskHealth,
         [Parameter(Mandatory = $true)]$Antivirus,
         [Parameter(Mandatory = $true)]$Backup
     )
 
     $alerts = New-Object System.Collections.Generic.List[string]
     $healthStatus = 'OK'
+    if ($Volumes.Count -eq 0) { $alerts.Add('Volume information unavailable') }
+    if ($DiskHealth.Count -eq 0) { $alerts.Add('Disk health information unavailable') }
 
     foreach ($v in $Volumes) {
         if ($v.driveLetter -eq 'C:' -and [double]$v.freeGb -lt 20) {
@@ -828,7 +830,7 @@ function Invoke-SignedPost {
     Write-LogLine -Level 'DEBUG' -Message ("POST Endpoint: {0}" -f $Endpoint)
     Write-LogLine -Level 'DEBUG' -Message ("POST Body: {0}" -f (Mask-SensitiveText -Text $outerJson))
 
-    $response = Invoke-WebRequest -Uri $Endpoint -Method Post -ContentType 'application/json; charset=utf-8' -Body $bodyBytes -UseBasicParsing -ErrorAction Stop
+    $response = Invoke-WebRequest -Uri $Endpoint -Method Post -ContentType 'application/json; charset=utf-8' -Body $bodyBytes -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
     $content = [string]$response.Content
 
     Write-LogLine -Level 'DEBUG' -Message ("Response Status: {0}" -f $response.StatusCode)
@@ -859,11 +861,11 @@ try {
     Write-Info ("CustomerGroup: {0}" -f $customerGroup)
 
     $antivirus = Get-AntivirusInfo
-    $volumes = Get-VolumeInfo
+    $volumes = @(Get-VolumeInfo)
     $backup = Get-BackupInfo -Volumes $volumes
-    $volumes = Apply-BackupFlagsToVolumes -Volumes $volumes -BackupInfo $backup
-    $diskHealth = Get-DiskHealthInfo
-    $volumes = Apply-SmartStatusToVolumes -Volumes $volumes -DiskHealth $diskHealth
+    $volumes = @(Apply-BackupFlagsToVolumes -Volumes $volumes -BackupInfo $backup)
+    $diskHealth = @(Get-DiskHealthInfo)
+    $volumes = @(Apply-SmartStatusToVolumes -Volumes $volumes -DiskHealth $diskHealth)
     $health = Get-HealthStatusAndAlerts -Volumes $volumes -DiskHealth $diskHealth -Antivirus $antivirus -Backup $backup
 
     $payload = [ordered]@{
@@ -906,7 +908,7 @@ try {
     if ($res.StatusCode -eq 200 -and $res.Content -match '^ok') {
         Write-Ok 'Health report sent successfully.'
     } else {
-        Write-Warn ("Unexpected response: {0}" -f $res.Content)
+        throw 'Health report was not acknowledged by the server.'
     }
 }
 catch {
